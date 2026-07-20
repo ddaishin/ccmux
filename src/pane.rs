@@ -301,6 +301,7 @@ fn pty_reader_thread(
                 let mut parser = parser.lock().unwrap_or_else(|e| e.into_inner());
                 parser.process(data);
                 drop(parser);
+                crate::perf::mark_pty_event();
                 let _ = event_tx.send(AppEvent::PtyOutput(pane_id));
             }
             Err(_) => {

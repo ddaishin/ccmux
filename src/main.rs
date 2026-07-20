@@ -2,6 +2,7 @@ mod app;
 mod claude_monitor;
 mod filetree;
 mod pane;
+mod perf;
 mod preview;
 mod ui;
 mod version_check;
@@ -97,6 +98,7 @@ fn run_event_loop(
     app: &mut app::App,
 ) -> Result<()> {
     let mut paste_buffer: Vec<u8> = Vec::new();
+    let mut perf_log = perf::PerfLog::from_env();
 
     loop {
         // Drain any PTY output events
@@ -130,9 +132,13 @@ fn run_event_loop(
         // Only render when something changed (and no cooldown is active)
         if app.dirty && app.paste_cooldown == 0 && app.resize_cooldown == 0 {
             app.dirty = false;
+            let draw_start = std::time::Instant::now();
             terminal.draw(|frame| {
                 ui::render(app, frame);
             })?;
+            if let Some(p) = perf_log.as_mut() {
+                p.on_frame(draw_start, draw_start.elapsed());
+            }
         }
 
         if app.should_quit {
@@ -141,6 +147,7 @@ fn run_event_loop(
 
         // Poll for crossterm events with a short timeout (~30fps)
         if event::poll(Duration::from_millis(33))? {
+            perf::mark_input_event();
             match event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
