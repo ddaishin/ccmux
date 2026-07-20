@@ -4,6 +4,7 @@ mod filetree;
 mod pane;
 mod perf;
 mod preview;
+mod timing;
 mod ui;
 mod version_check;
 
@@ -111,26 +112,18 @@ fn run_event_loop(
             }
         }
 
-        // After paste, wait a few frames for PTY echo to settle
-        if app.paste_cooldown > 0 {
-            app.paste_cooldown -= 1;
-            if app.paste_cooldown == 0 {
-                app.dirty = true;
-            }
+        // Cooldown expiry (paste echo settle / post-layout-change
+        // SIGWINCH settle) schedules exactly one redraw.
+        let now = std::time::Instant::now();
+        if app.paste_cooldown.take_expired(now) {
+            app.dirty = true;
         }
-
-        // After a layout change (split/close/sidebar/terminal resize),
-        // wait a few frames so child PTYs can respond to SIGWINCH with
-        // a fresh redraw. Prevents the "old buffer at new size" flash.
-        if app.resize_cooldown > 0 {
-            app.resize_cooldown -= 1;
-            if app.resize_cooldown == 0 {
-                app.dirty = true;
-            }
+        if app.resize_cooldown.take_expired(now) {
+            app.dirty = true;
         }
 
         // Only render when something changed (and no cooldown is active)
-        if app.dirty && app.paste_cooldown == 0 && app.resize_cooldown == 0 {
+        if app.dirty && !app.paste_cooldown.is_active(now) && !app.resize_cooldown.is_active(now) {
             app.dirty = false;
             let draw_start = std::time::Instant::now();
             terminal.draw(|frame| {
@@ -183,7 +176,8 @@ fn run_event_loop(
                 }
                 Event::Paste(text) => {
                     app.forward_paste_to_pty(&text)?;
-                    app.paste_cooldown = 5;
+                    app.paste_cooldown
+                        .arm(std::time::Instant::now(), app::PASTE_COOLDOWN);
                     app.dirty = true;
                 }
                 Event::Mouse(mouse) => {
@@ -227,7 +221,8 @@ fn flush_paste_buffer(app: &mut app::App, buffer: &mut Vec<u8>) -> Result<()> {
             } else {
                 pane.write_input(buffer)?;
             }
-            app.paste_cooldown = 5;
+            app.paste_cooldown
+                .arm(std::time::Instant::now(), app::PASTE_COOLDOWN);
         } else {
             // Normal typing — send directly
             pane.write_input(buffer)?;

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -10,6 +10,13 @@ use ratatui::layout::Rect;
 use crate::filetree::FileTree;
 use crate::pane::Pane;
 use crate::preview::Preview;
+
+/// How long rendering is held after a paste so the PTY echo settles.
+/// Starts at parity with the old 5-frame (~165ms at 30fps) hold; tune
+/// downward only after the perf log confirms no regression.
+pub const PASTE_COOLDOWN: Duration = Duration::from_millis(150);
+/// How long rendering is held after a layout change (SIGWINCH settle).
+pub const RESIZE_COOLDOWN: Duration = Duration::from_millis(150);
 
 /// Strip bracketed paste escape sequences (`\x1b[200~` and `\x1b[201~`) from
 /// paste content to prevent bracket-paste escape injection attacks.  Major
@@ -404,12 +411,13 @@ pub struct App {
     pub event_rx: Receiver<AppEvent>,
     next_pane_id: usize,
     pub dirty: bool,
-    pub paste_cooldown: u8, // frames to skip rendering after paste
-    /// Frames to skip rendering after a layout change (split, close,
-    /// sidebar toggle, terminal resize). Gives Claude Code / bash time
-    /// to process SIGWINCH and send a fresh redraw before we paint,
+    /// Hold rendering briefly after a paste so the PTY echo settles.
+    pub paste_cooldown: crate::timing::Cooldown,
+    /// Hold rendering after a layout change (split, close, sidebar
+    /// toggle, terminal resize). Gives Claude Code / bash time to
+    /// process SIGWINCH and send a fresh redraw before we paint,
     /// avoiding the brief "old buffer at new size" garbled frame.
-    pub resize_cooldown: u8,
+    pub resize_cooldown: crate::timing::Cooldown,
     /// Last known terminal size (cols, rows). Updated from main.rs on
     /// Event::Resize and from ui::render on every frame. Used by
     /// `relayout_panes()` so layout-change handlers can resize PTYs
@@ -467,8 +475,8 @@ impl App {
             event_rx,
             next_pane_id: 2,
             dirty: true,
-            paste_cooldown: 0,
-            resize_cooldown: 0,
+            paste_cooldown: crate::timing::Cooldown::default(),
+            resize_cooldown: crate::timing::Cooldown::default(),
             last_term_size: (cols, rows),
             file_tree_width: 20,
             preview_width: 40,
@@ -586,9 +594,10 @@ impl App {
     pub fn mark_layout_change(&mut self) {
         let changed = self.relayout_panes();
         if changed {
-            // Take max so a freshly-triggered layout change on top of
-            // an existing cooldown doesn't prematurely cut the wait.
-            self.resize_cooldown = self.resize_cooldown.max(5);
+            // Cooldown::arm has max semantics, so a freshly-triggered
+            // layout change on top of an existing cooldown doesn't
+            // prematurely cut the wait.
+            self.resize_cooldown.arm(Instant::now(), RESIZE_COOLDOWN);
         }
         // Any in-flight selection is bound to the old geometry.
         self.selection = None;
