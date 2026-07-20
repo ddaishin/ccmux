@@ -176,19 +176,22 @@ impl ClaudeMonitor {
 
     /// Update monitoring for a pane with its current cwd.
     /// Throttled to CHECK_INTERVAL to avoid per-frame syscalls.
-    pub fn update(&self, pane_id: usize, cwd: &Path) {
+    /// Returns true when the visible state changed (new JSONL data read,
+    /// or the state was reset), so the caller can schedule a redraw.
+    pub fn update(&self, pane_id: usize, cwd: &Path) -> bool {
+        let mut state_changed = false;
         // Phase 1: check if we should run at all (short lock)
         let (path_to_read, read_from) = {
             let mut map = match self.inner.lock() {
                 Ok(m) => m,
-                Err(_) => return,
+                Err(_) => return false,
             };
 
             let monitor = map.entry(pane_id).or_insert_with(PaneMonitor::new);
 
             // Throttle: skip if checked recently
             if monitor.last_check.elapsed() < CHECK_INTERVAL {
-                return;
+                return false;
             }
             monitor.last_check = Instant::now();
 
@@ -209,22 +212,23 @@ impl ClaudeMonitor {
                     monitor.state = ClaudeState::default();
                     monitor.active_task_ids.clear();
                     monitor.counted_request_ids.clear();
+                    state_changed = true;
                 }
             }
 
             let path = match &monitor.jsonl_path {
                 Some(p) => p.clone(),
-                None => return,
+                None => return state_changed,
             };
 
             // Check file metadata — skip if unchanged, detect truncation/rotation
             let meta = match std::fs::metadata(&path) {
                 Ok(m) => m,
-                Err(_) => return,
+                Err(_) => return state_changed,
             };
             let mtime = meta.modified().ok();
             if mtime == monitor.last_mtime {
-                return;
+                return state_changed;
             }
             monitor.last_mtime = mtime;
 
@@ -234,6 +238,7 @@ impl ClaudeMonitor {
                 monitor.state = ClaudeState::default();
                 monitor.active_task_ids.clear();
                 monitor.counted_request_ids.clear();
+                state_changed = true;
             }
 
             (path, monitor.file_position)
@@ -242,11 +247,11 @@ impl ClaudeMonitor {
         // Phase 2: read file without holding the lock
         let file = match File::open(&path_to_read) {
             Ok(f) => f,
-            Err(_) => return,
+            Err(_) => return state_changed,
         };
         let mut reader = BufReader::new(file);
         if reader.seek(SeekFrom::Start(read_from)).is_err() {
-            return;
+            return state_changed;
         }
 
         let mut new_lines = Vec::new();
@@ -268,7 +273,7 @@ impl ClaudeMonitor {
 
         // Phase 3: apply parsed events (short lock)
         if new_lines.is_empty() {
-            return;
+            return state_changed;
         }
         if let Ok(mut map) = self.inner.lock() {
             if let Some(monitor) = map.get_mut(&pane_id) {
@@ -276,8 +281,23 @@ impl ClaudeMonitor {
                 for line in &new_lines {
                     process_event(monitor, line);
                 }
+                state_changed = true;
             }
         }
+        state_changed
+    }
+
+    /// Earliest upcoming check across panes that are actually monitoring a
+    /// JSONL file (for event-loop deadline computation). Panes without a
+    /// located JSONL don't schedule wakeups — new-session detection rides
+    /// on PTY-output wakeups and the idle tick instead.
+    pub fn next_check_at(&self) -> Option<Instant> {
+        self.inner.lock().ok().and_then(|map| {
+            map.values()
+                .filter(|m| m.jsonl_path.is_some())
+                .map(|m| m.last_check + CHECK_INTERVAL)
+                .min()
+        })
     }
 
     pub fn remove(&self, pane_id: usize) {

@@ -153,6 +153,7 @@ fn run_event_loop(
             app.ws()
                 .file_tree_visible
                 .then(|| app.ws().file_tree.next_refresh_at()),
+            app.next_claude_check_at(),
             pacer.deadline_if_dirty(app.dirty, now),
             Some(now + IDLE_TIMEOUT),
         ])
@@ -183,6 +184,11 @@ fn run_event_loop(
             app.dirty = true;
         }
         if app.ws().file_tree_visible && app.ws_mut().file_tree.auto_refresh_if_needed() {
+            app.dirty = true;
+        }
+        // JSONL monitor I/O runs here, outside the draw closure, so a slow
+        // file read can never stall inside terminal.draw.
+        if app.update_claude_monitors() {
             app.dirty = true;
         }
 

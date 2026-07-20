@@ -341,21 +341,6 @@ fn render_panes(app: &mut App, frame: &mut Frame, area: Rect) {
         }
     }
 
-    // Update Claude monitor for each pane using the pane's own cwd
-    // (may differ from workspace cwd if user cd'd inside the pane)
-    let pane_cwds: Vec<(usize, std::path::PathBuf)> = rects
-        .iter()
-        .filter_map(|&(pane_id, _)| {
-            app.ws()
-                .panes
-                .get(&pane_id)
-                .map(|p| (pane_id, p.cwd.clone()))
-        })
-        .collect();
-    for (pane_id, cwd) in pane_cwds {
-        app.claude_monitor.update(pane_id, &cwd);
-    }
-
     let focused_id = app.ws().focused_pane_id;
     let focus_target = app.ws().focus_target;
     let selection = app.selection.clone();
@@ -493,19 +478,26 @@ fn render_single_pane(
             .alignment(Alignment::Center);
         frame.render_widget(msg, inner);
     } else {
-        render_terminal_content(pane, is_focused, selection, frame, inner);
+        render_terminal_content(pane, is_focused, is_claude, selection, frame, inner);
     }
 }
 
 fn render_terminal_content(
     pane: &crate::pane::Pane,
     is_focused: bool,
+    is_claude: bool,
     selection: Option<&crate::app::TextSelection>,
     frame: &mut Frame,
     area: Rect,
 ) {
     let parser = pane.parser.lock().unwrap_or_else(|e| e.into_inner());
     let screen = parser.screen();
+
+    // Normalize the selection once per frame (it is constant across cells);
+    // zero-area selections (single click, no drag) don't highlight.
+    let sel_bounds = selection
+        .map(|s| s.normalized())
+        .filter(|&(sr, sc, er, ec)| sr != er || sc != ec);
 
     let rows = area.height as usize;
     let cols = area.width as usize;
@@ -536,9 +528,8 @@ fn render_terminal_content(
                 };
 
                 // Apply selection highlight (only if dragged, not single click)
-                let has_selection = selection.map_or(false, |s| {
-                    let (sr, sc, er, ec) = s.normalized();
-                    (sr != er || sc != ec) && s.contains(row as u32, col as u32)
+                let has_selection = sel_bounds.is_some_and(|b| {
+                    crate::app::TextSelection::contains_in(b, row as u32, col as u32)
                 });
                 let final_style = if has_selection {
                     Style::default()
@@ -559,13 +550,13 @@ fn render_terminal_content(
     // Show cursor when focused.
     // For non-Claude panes, respect the PTY's hide_cursor request.
     // For Claude Code, always show because Claude relies on the terminal cursor.
-    let show_cursor = is_focused && (!screen.hide_cursor() || pane.is_claude_running());
+    let show_cursor = is_focused && (!screen.hide_cursor() || is_claude);
     if show_cursor {
         let cursor = screen.cursor_position();
         // For Claude Code, shift cursor 1 column left because Claude draws its own
         // block character at the cursor position, and the PTY cursor would otherwise
         // appear one column after with a visible gap.
-        let cursor_x = if pane.is_claude_running() {
+        let cursor_x = if is_claude {
             area.x + cursor.1.saturating_sub(1)
         } else {
             area.x + cursor.1

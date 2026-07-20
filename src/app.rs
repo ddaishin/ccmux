@@ -311,7 +311,14 @@ impl TextSelection {
 
     /// Check if a cell is within the selection.
     pub fn contains(&self, row: u32, col: u32) -> bool {
-        let (sr, sc, er, ec) = self.normalized();
+        Self::contains_in(self.normalized(), row, col)
+    }
+
+    /// Check if a cell is within pre-normalized bounds (see
+    /// [`Self::normalized`]). Split out so per-cell render loops can
+    /// normalize once per frame instead of once per cell.
+    pub fn contains_in(bounds: (u32, u32, u32, u32), row: u32, col: u32) -> bool {
+        let (sr, sc, er, ec) = bounds;
         if row < sr || row > er {
             return false;
         }
@@ -1771,6 +1778,33 @@ impl App {
                 AppEvent::Input(_) => unreachable!("filtered above"),
             }
         }
+    }
+
+    /// Refresh the Claude JSONL monitors for every pane in the active
+    /// workspace using each pane's own cwd (may differ from the workspace
+    /// cwd if the user cd'd inside the pane). Throttled internally.
+    /// Returns true when any monitor state changed, so the caller can
+    /// schedule a redraw — necessary because the JSONL can advance
+    /// without any accompanying PTY output.
+    pub fn update_claude_monitors(&mut self) -> bool {
+        let pane_cwds: Vec<(usize, PathBuf)> = self
+            .ws()
+            .panes
+            .iter()
+            .map(|(&id, p)| (id, p.cwd.clone()))
+            .collect();
+        let mut changed = false;
+        for (pane_id, cwd) in pane_cwds {
+            if self.claude_monitor.update(pane_id, &cwd) {
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// When the next Claude monitor check is due (event-loop deadline).
+    pub fn next_claude_check_at(&self) -> Option<Instant> {
+        self.claude_monitor.next_check_at()
     }
 
     pub fn shutdown(&mut self) {
