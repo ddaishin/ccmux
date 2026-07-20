@@ -147,6 +147,13 @@ fn run_event_loop(
         // the coalescing window: events arriving before next_frame are
         // all drained into the same upcoming frame.
         let now = std::time::Instant::now();
+        // While a cooldown suppresses drawing, a dirty frame cannot be
+        // drawn anyway — scheduling the pacer deadline would spin the
+        // loop with a zero timeout until the cooldown expires. The
+        // cooldown's own deadline (first two entries) guarantees the
+        // post-cooldown redraw wakeup.
+        let can_draw_now =
+            !app.paste_cooldown.is_active(now) && !app.resize_cooldown.is_active(now);
         let deadline = timing::earliest([
             app.paste_cooldown.deadline(),
             app.resize_cooldown.deadline(),
@@ -154,7 +161,7 @@ fn run_event_loop(
                 .file_tree_visible
                 .then(|| app.ws().file_tree.next_refresh_at()),
             app.next_claude_check_at(),
-            pacer.deadline_if_dirty(app.dirty, now),
+            pacer.deadline_if_dirty(app.dirty && can_draw_now, now),
             Some(now + IDLE_TIMEOUT),
         ])
         .expect("idle timeout always present");
@@ -199,13 +206,14 @@ fn run_event_loop(
             && pacer.ready(now)
         {
             app.dirty = false;
-            let draw_start = std::time::Instant::now();
+            let draw_start = perf_log.as_ref().map(|_| std::time::Instant::now());
             terminal.draw(|frame| {
                 ui::render(app, frame);
             })?;
-            pacer.mark_drawn(std::time::Instant::now());
-            if let Some(p) = perf_log.as_mut() {
-                p.on_frame(draw_start, draw_start.elapsed());
+            let after_draw = std::time::Instant::now();
+            pacer.mark_drawn(after_draw);
+            if let (Some(p), Some(start)) = (perf_log.as_mut(), draw_start) {
+                p.on_frame(start, after_draw.duration_since(start));
             }
         }
 
@@ -281,8 +289,18 @@ fn handle_input_event(
 /// no longer terminates the window (it only marks the screen dirty), and
 /// the window is read from the unified channel.
 fn collect_key_burst(app: &mut app::App, paste_buffer: &mut Vec<u8>) -> Result<()> {
+    // Absolute deadline, extended only when a key arrives. PTY output
+    // events must NOT extend it: during heavy output they arrive faster
+    // than the window and a relative timeout would keep the window open
+    // (freezing rendering and swallowing normal keystrokes into a
+    // "paste") until the output pauses.
+    let mut window_end = std::time::Instant::now() + KEY_BURST_WINDOW;
     loop {
-        match app.event_rx.recv_timeout(KEY_BURST_WINDOW) {
+        let remaining = window_end.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(()); // window closed
+        }
+        match app.event_rx.recv_timeout(remaining) {
             Ok(app::AppEvent::Input(Event::Key(k))) => {
                 if app.handle_key_event(k)? {
                     // Shortcut consumed — flush what we have first
@@ -294,9 +312,10 @@ fn collect_key_burst(app: &mut app::App, paste_buffer: &mut Vec<u8>) -> Result<(
                     paste_buffer.extend_from_slice(&b);
                 }
                 app.dirty = true;
+                window_end = std::time::Instant::now() + KEY_BURST_WINDOW;
             }
             Ok(ev @ app::AppEvent::PtyOutput(_)) => {
-                // Burst continues; just note the pending redraw.
+                // Burst may continue; just note the pending redraw.
                 app.handle_pty_event(ev);
             }
             Ok(other) => {

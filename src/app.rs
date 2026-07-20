@@ -1803,8 +1803,11 @@ impl App {
     }
 
     /// When the next Claude monitor check is due (event-loop deadline).
+    /// Scoped to the active workspace's panes — the same set
+    /// `update_claude_monitors` refreshes — so a background tab's frozen
+    /// monitor can never produce a permanently-past deadline.
     pub fn next_claude_check_at(&self) -> Option<Instant> {
-        self.claude_monitor.next_check_at()
+        self.claude_monitor.next_check_at(self.ws().panes.keys())
     }
 
     pub fn shutdown(&mut self) {

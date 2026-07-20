@@ -287,17 +287,22 @@ impl ClaudeMonitor {
         state_changed
     }
 
-    /// Earliest upcoming check across panes that are actually monitoring a
-    /// JSONL file (for event-loop deadline computation). Panes without a
-    /// located JSONL don't schedule wakeups — new-session detection rides
-    /// on PTY-output wakeups and the idle tick instead.
-    pub fn next_check_at(&self) -> Option<Instant> {
-        self.inner.lock().ok().and_then(|map| {
-            map.values()
-                .filter(|m| m.jsonl_path.is_some())
-                .map(|m| m.last_check + CHECK_INTERVAL)
-                .min()
-        })
+    /// Earliest upcoming check across the given panes, considering only
+    /// panes that are actually monitoring a JSONL file (for event-loop
+    /// deadline computation). The caller passes the panes it will actually
+    /// update (the active workspace's) — monitors of background tabs are
+    /// not updated, so scheduling wakeups for them would spin the loop on
+    /// a deadline that never advances. Panes without a located JSONL don't
+    /// schedule wakeups either — new-session detection rides on PTY-output
+    /// wakeups and the idle tick instead.
+    pub fn next_check_at<'a>(&self, pane_ids: impl IntoIterator<Item = &'a usize>) -> Option<Instant> {
+        let map = self.inner.lock().ok()?;
+        pane_ids
+            .into_iter()
+            .filter_map(|id| map.get(id))
+            .filter(|m| m.jsonl_path.is_some())
+            .map(|m| m.last_check + CHECK_INTERVAL)
+            .min()
     }
 
     pub fn remove(&self, pane_id: usize) {
