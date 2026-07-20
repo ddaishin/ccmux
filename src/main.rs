@@ -94,26 +94,87 @@ fn main() -> Result<()> {
     result
 }
 
+/// Minimum interval between two draws (frame pacing, ~60fps cap).
+const MIN_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Upper bound on how long the loop sleeps with nothing to do.
+const IDLE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// How long to keep collecting a rapid key burst (paste detection).
+/// The old inline `event::poll(1ms)` window plus 1ms of slack for the
+/// input-thread → channel hop. Clipboard pastes arrive at µs intervals,
+/// human typing at ≥30ms, so this cannot merge normal keystrokes.
+const KEY_BURST_WINDOW: Duration = Duration::from_millis(2);
+
+/// Reads crossterm events on a dedicated thread and forwards them into the
+/// app's event channel, so the main loop can block on one channel and wake
+/// immediately for both PTY output and user input.
+///
+/// The thread is detached: `event::read()` cannot be interrupted safely, so
+/// it lives until the process exits (or until the receiver is dropped, which
+/// makes the forwarding `send` fail).
+fn spawn_input_thread(tx: std::sync::mpsc::Sender<app::AppEvent>) {
+    std::thread::spawn(move || loop {
+        match event::read() {
+            // Windows delivers Key events for Press, Release and Repeat;
+            // only Press must reach the app (matches the old loop).
+            Ok(Event::Key(k)) if k.kind != KeyEventKind::Press => continue,
+            Ok(ev) => {
+                perf::mark_input_event();
+                if tx.send(app::AppEvent::Input(ev)).is_err() {
+                    break;
+                }
+            }
+            Err(_) => {
+                // Transient read error — avoid a hot spin.
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    });
+}
+
 fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut app::App,
 ) -> Result<()> {
     let mut paste_buffer: Vec<u8> = Vec::new();
     let mut perf_log = perf::PerfLog::from_env();
+    let mut pacer = timing::FramePacer::new(MIN_FRAME_INTERVAL);
+
+    spawn_input_thread(app.event_tx.clone());
 
     loop {
-        // Drain any PTY output events
-        app.drain_pty_events();
+        // ── 1. Sleep until the next event or the earliest timer ──
+        // While dirty but pacing-blocked, the pacer deadline doubles as
+        // the coalescing window: events arriving before next_frame are
+        // all drained into the same upcoming frame.
+        let now = std::time::Instant::now();
+        let deadline = timing::earliest([
+            app.paste_cooldown.deadline(),
+            app.resize_cooldown.deadline(),
+            app.ws()
+                .file_tree_visible
+                .then(|| app.ws().file_tree.next_refresh_at()),
+            pacer.deadline_if_dirty(app.dirty, now),
+            Some(now + IDLE_TIMEOUT),
+        ])
+        .expect("idle timeout always present");
 
-        // Auto-refresh file tree if sidebar is visible
-        if app.ws().file_tree_visible {
-            if app.ws_mut().file_tree.auto_refresh_if_needed() {
-                app.dirty = true;
+        match app
+            .event_rx
+            .recv_timeout(deadline.saturating_duration_since(now))
+        {
+            Ok(ev) => {
+                handle_app_event(app, ev, &mut paste_buffer)?;
+                // Coalesce everything else that is already queued.
+                while let Ok(ev) = app.event_rx.try_recv() {
+                    handle_app_event(app, ev, &mut paste_buffer)?;
+                }
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // Cannot happen while App holds event_tx; defensive exit.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        // Cooldown expiry (paste echo settle / post-layout-change
-        // SIGWINCH settle) schedules exactly one redraw.
+        // ── 2. Timers ──
         let now = std::time::Instant::now();
         if app.paste_cooldown.take_expired(now) {
             app.dirty = true;
@@ -121,14 +182,22 @@ fn run_event_loop(
         if app.resize_cooldown.take_expired(now) {
             app.dirty = true;
         }
+        if app.ws().file_tree_visible && app.ws_mut().file_tree.auto_refresh_if_needed() {
+            app.dirty = true;
+        }
 
-        // Only render when something changed (and no cooldown is active)
-        if app.dirty && !app.paste_cooldown.is_active(now) && !app.resize_cooldown.is_active(now) {
+        // ── 3. Paced render ──
+        if app.dirty
+            && !app.paste_cooldown.is_active(now)
+            && !app.resize_cooldown.is_active(now)
+            && pacer.ready(now)
+        {
             app.dirty = false;
             let draw_start = std::time::Instant::now();
             terminal.draw(|frame| {
                 ui::render(app, frame);
             })?;
+            pacer.mark_drawn(std::time::Instant::now());
             if let Some(p) = perf_log.as_mut() {
                 p.on_frame(draw_start, draw_start.elapsed());
             }
@@ -137,65 +206,102 @@ fn run_event_loop(
         if app.should_quit {
             break;
         }
-
-        // Poll for crossterm events with a short timeout (~30fps)
-        if event::poll(Duration::from_millis(33))? {
-            perf::mark_input_event();
-            match event::read()? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Press {
-                        let consumed = app.handle_key_event(key)?;
-                        if !consumed {
-                            // Collect rapid key events as potential paste
-                            if let Some(bytes) = crate::app::key_event_to_bytes_pub(&key) {
-                                paste_buffer.extend_from_slice(&bytes);
-                                // Drain all immediately available key events (paste burst)
-                                while event::poll(Duration::from_millis(1))? {
-                                    if let Event::Key(k) = event::read()? {
-                                        if k.kind == KeyEventKind::Press {
-                                            if app.handle_key_event(k)? {
-                                                // Shortcut consumed — flush buffer first
-                                                if !paste_buffer.is_empty() {
-                                                    flush_paste_buffer(app, &mut paste_buffer)?;
-                                                }
-                                                break;
-                                            }
-                                            if let Some(b) = crate::app::key_event_to_bytes_pub(&k) {
-                                                paste_buffer.extend_from_slice(&b);
-                                            }
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                flush_paste_buffer(app, &mut paste_buffer)?;
-                            }
-                        }
-                        app.dirty = true;
-                    }
-                }
-                Event::Paste(text) => {
-                    app.forward_paste_to_pty(&text)?;
-                    app.paste_cooldown
-                        .arm(std::time::Instant::now(), app::PASTE_COOLDOWN);
-                    app.dirty = true;
-                }
-                Event::Mouse(mouse) => {
-                    app.handle_mouse_event(mouse);
-                    app.dirty = true;
-                }
-                Event::Resize(cols, rows) => {
-                    // Propagate the new terminal size to App so every
-                    // pane's PTY gets a prompt SIGWINCH, and hold the
-                    // paint for a few frames while the children redraw.
-                    app.on_terminal_resize(cols, rows);
-                }
-                _ => {}
-            }
-        }
     }
 
     Ok(())
+}
+
+/// Dispatch one channel event. PTY-side events go to `App::handle_pty_event`;
+/// terminal input is handled here because paste-burst detection needs the
+/// main loop's paste buffer.
+fn handle_app_event(
+    app: &mut app::App,
+    ev: app::AppEvent,
+    paste_buffer: &mut Vec<u8>,
+) -> Result<()> {
+    match ev {
+        app::AppEvent::Input(event) => handle_input_event(app, event, paste_buffer),
+        other => {
+            app.handle_pty_event(other);
+            Ok(())
+        }
+    }
+}
+
+fn handle_input_event(
+    app: &mut app::App,
+    event: Event,
+    paste_buffer: &mut Vec<u8>,
+) -> Result<()> {
+    match event {
+        // Only Press events reach us (filtered in the input thread).
+        Event::Key(key) => {
+            let consumed = app.handle_key_event(key)?;
+            if !consumed {
+                // Collect rapid key events as potential paste
+                if let Some(bytes) = crate::app::key_event_to_bytes_pub(&key) {
+                    paste_buffer.extend_from_slice(&bytes);
+                    collect_key_burst(app, paste_buffer)?;
+                    flush_paste_buffer(app, paste_buffer)?;
+                }
+            }
+            app.dirty = true;
+        }
+        Event::Paste(text) => {
+            app.forward_paste_to_pty(&text)?;
+            app.paste_cooldown
+                .arm(std::time::Instant::now(), app::PASTE_COOLDOWN);
+            app.dirty = true;
+        }
+        Event::Mouse(mouse) => {
+            app.handle_mouse_event(mouse);
+            app.dirty = true;
+        }
+        Event::Resize(cols, rows) => {
+            // Propagate the new terminal size to App so every pane's PTY
+            // gets a prompt SIGWINCH, and hold the paint briefly while
+            // the children redraw.
+            app.on_terminal_resize(cols, rows);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Keep collecting keys that arrive within [`KEY_BURST_WINDOW`] of each
+/// other into `paste_buffer` (clipboard-paste detection on terminals that
+/// send pastes as a key burst). Mirrors the old nested `event::poll(1ms)`
+/// loop, with two intentional differences: PTY output arriving mid-burst
+/// no longer terminates the window (it only marks the screen dirty), and
+/// the window is read from the unified channel.
+fn collect_key_burst(app: &mut app::App, paste_buffer: &mut Vec<u8>) -> Result<()> {
+    loop {
+        match app.event_rx.recv_timeout(KEY_BURST_WINDOW) {
+            Ok(app::AppEvent::Input(Event::Key(k))) => {
+                if app.handle_key_event(k)? {
+                    // Shortcut consumed — flush what we have first
+                    // (preserves the old ordering guarantee).
+                    flush_paste_buffer(app, paste_buffer)?;
+                    return Ok(());
+                }
+                if let Some(b) = crate::app::key_event_to_bytes_pub(&k) {
+                    paste_buffer.extend_from_slice(&b);
+                }
+                app.dirty = true;
+            }
+            Ok(ev @ app::AppEvent::PtyOutput(_)) => {
+                // Burst continues; just note the pending redraw.
+                app.handle_pty_event(ev);
+            }
+            Ok(other) => {
+                // Any other event ends the burst: flush, then handle it.
+                flush_paste_buffer(app, paste_buffer)?;
+                handle_app_event(app, other, paste_buffer)?;
+                return Ok(());
+            }
+            Err(_) => return Ok(()), // window closed (timeout)
+        }
+    }
 }
 
 /// Flush accumulated key buffer to PTY. If multiple characters were collected

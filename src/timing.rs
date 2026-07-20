@@ -43,7 +43,6 @@ impl Cooldown {
     }
 
     /// The pending deadline, if any (for recv_timeout scheduling).
-    #[allow(dead_code)] // used by the event-driven loop (next commit)
     pub fn deadline(&self) -> Option<Instant> {
         self.until
     }
@@ -51,13 +50,11 @@ impl Cooldown {
 
 /// Caps the redraw rate at one frame per `min_interval` (frame pacing).
 #[derive(Debug)]
-#[allow(dead_code)] // used by the event-driven loop (next commit)
 pub struct FramePacer {
     min_interval: Duration,
     next_frame: Option<Instant>,
 }
 
-#[allow(dead_code)] // used by the event-driven loop (next commit)
 impl FramePacer {
     pub fn new(min_interval: Duration) -> Self {
         FramePacer {
@@ -90,7 +87,6 @@ impl FramePacer {
 }
 
 /// Earliest of the given optional deadlines.
-#[allow(dead_code)] // used by the event-driven loop (next commit)
 pub fn earliest(deadlines: impl IntoIterator<Item = Option<Instant>>) -> Option<Instant> {
     deadlines.into_iter().flatten().min()
 }

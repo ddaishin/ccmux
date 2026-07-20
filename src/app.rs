@@ -72,6 +72,9 @@ pub enum AppEvent {
     PtyEof(usize),
     /// Shell changed working directory (pane_id, new path).
     CwdChanged(usize, PathBuf),
+    /// Terminal input (key/mouse/paste/resize) forwarded by the input
+    /// thread, so the main loop can block on a single channel.
+    Input(crossterm::event::Event),
 }
 
 /// Split direction for layout.
@@ -1706,10 +1709,17 @@ impl App {
         Ok(())
     }
 
-    pub fn drain_pty_events(&mut self) -> bool {
-        let mut had_events = false;
-        while let Ok(event) = self.event_rx.try_recv() {
-            had_events = true;
+    /// Handle a single PTY-side event (PtyOutput/PtyEof/CwdChanged).
+    /// `AppEvent::Input` is the main loop's responsibility (it owns the
+    /// paste buffer) and is ignored here.
+    pub fn handle_pty_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Input(_) => return,
+            AppEvent::PtyOutput(_) | AppEvent::PtyEof(_) | AppEvent::CwdChanged(..) => {
+                self.dirty = true;
+            }
+        }
+        {
             match event {
                 AppEvent::PtyEof(pane_id) => {
                     for ws in &mut self.workspaces {
@@ -1725,7 +1735,7 @@ impl App {
                     // (prevents OSC 7 escape sequence path injection).
                     let new_cwd = match new_cwd.canonicalize() {
                         Ok(p) if p.is_dir() => p,
-                        _ => continue,
+                        _ => return,
                     };
                     for ws in &mut self.workspaces {
                         if ws.panes.contains_key(&pane_id) {
@@ -1758,12 +1768,9 @@ impl App {
                     }
                 }
                 AppEvent::PtyOutput(_) => {}
+                AppEvent::Input(_) => unreachable!("filtered above"),
             }
         }
-        if had_events {
-            self.dirty = true;
-        }
-        had_events
     }
 
     pub fn shutdown(&mut self) {

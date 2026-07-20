@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A node in the file tree.
 #[derive(Debug, Clone)]
@@ -251,6 +251,11 @@ impl FileTree {
             }
         }
         false
+    }
+
+    /// When the next auto-refresh is due (for event-loop scheduling).
+    pub fn next_refresh_at(&self) -> Instant {
+        self.last_refresh + Duration::from_secs(AUTO_REFRESH_INTERVAL_SECS)
     }
 
     /// Check if it's time to auto-refresh and do so if needed.
