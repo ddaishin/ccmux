@@ -42,8 +42,10 @@ pub struct Config {
 }
 
 impl Config {
-    /// 設定ファイルを読み込む。戻り値の .1 は起動を止めない警告。
-    /// ファイルが存在しない(読めない)場合は空設定・警告なし。
+    /// 設定ファイルを読み込む。戻り値の .1 は起動を止めない一時
+    /// メッセージ(パース失敗の警告、または初回の雛形生成通知)。
+    /// ファイル不在時は全コメントの雛形を生成して通知を返し(失敗時は
+    /// 無通知)、NotFound 以外の読み取りエラーは空設定・無通知で継続。
     pub fn load() -> (Self, Option<String>) {
         let Some(path) = config_path() else {
             return (Self::default(), None);
@@ -56,6 +58,11 @@ impl Config {
                     Some(format!("config.toml 読み込み失敗(設定を無視して継続): {}", e)),
                 ),
             },
+            // 不在時のみ雛形を生成(生成通知が .1 に乗る)。NotFound 以外の
+            // エラー(権限拒否等)では書き込みに行かず従来どおり空設定で継続。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (Self::default(), ensure_skel_at(&path))
+            }
             Err(_) => (Self::default(), None),
         }
     }
@@ -103,6 +110,54 @@ pub fn build_args(opener: &Opener, abs_path: &str) -> Vec<String> {
 
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("ccmux").join("config.toml"))
+}
+
+/// 初回起動時に生成する設定ファイルの雛形。全コメントのため
+/// 生成しても挙動は変わらない(空設定と等価)。
+pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
+# (このファイルは初回起動時に自動生成された雛形です。すべてコメントのため
+#  そのままでは何も変わりません。必要な設定のコメントを外して使ってください)
+#
+# [[openers]] = 拡張子別・外部オープナー設定(複数書けます)。
+# ファイルツリーで選択(Enter / クリック)したファイルの拡張子がマッチすると
+# 外部アプリで開きます。未登録拡張子・起動失敗時は従来どおり TUI プレビュー。
+#
+# 注意:
+# - 拡張子はドットなし・複合拡張子不可("tar.gz" ではなく "gz")
+# - Windows の .cmd シム(VS Code 等)は "code.cmd" のように拡張子まで書く
+# - {file} は対象ファイルの絶対パスに置換。省略時は末尾に自動付加
+# - ストアアプリ(MSIX)を直接パスで指定する場合、パスにバージョン番号が
+#   含まれるためアプリ更新で壊れる → その際はパスを更新すること
+
+# 例1: Markdown を Typora で開く
+#[[openers]]
+#extensions = ["md", "markdown"]
+#command = "typora"
+#args = ["{file}"]
+
+# 例2: Markdown を VS Code で開く
+#[[openers]]
+#extensions = ["md", "markdown"]
+#command = "code.cmd"
+#args = ["{file}"]
+"##;
+
+/// path に設定ファイルの雛形を生成する(初回起動時)。
+/// 不在判定は呼び出し側(read の NotFound)、作成は create_new で
+/// 原子的に行い、競合時も既存ファイルを上書きしない。
+/// あらゆる失敗は None(fail-open: 雛形は利便機能であり起動を止めない)。
+fn ensure_skel_at(path: &Path) -> Option<String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .ok()?;
+    use std::io::Write as _;
+    f.write_all(CONFIG_SKEL.as_bytes()).ok()?;
+    Some(format!("設定ファイルの雛形を作成しました: {}", path.display()))
 }
 
 #[cfg(test)]
@@ -176,6 +231,49 @@ mod tests {
             build_args(&o, "C:/work/a.md"),
             vec!["--open".to_string(), "C:/work/a.md".to_string()]
         );
+    }
+
+    /// テスト用の一意な一時ディレクトリ(tempdir crate 不使用)。
+    fn temp_dir_unique(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ccmux-skel-test-{}-{}", tag, std::process::id()))
+    }
+
+    #[test]
+    fn test_config_skel_parses_to_empty() {
+        let cfg = Config::parse(CONFIG_SKEL).unwrap();
+        assert!(cfg.openers.is_empty());
+    }
+
+    #[test]
+    fn test_ensure_skel_at_creates_when_missing() {
+        let dir = temp_dir_unique("create");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+        assert!(ensure_skel_at(&path).is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), CONFIG_SKEL);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ensure_skel_at_never_overwrites() {
+        let dir = temp_dir_unique("keep");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "user content").unwrap();
+        assert!(ensure_skel_at(&path).is_none());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "user content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_ensure_skel_at_creates_nested_dirs() {
+        let dir = temp_dir_unique("nested");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("a").join("b").join("config.toml");
+        assert!(ensure_skel_at(&path).is_some());
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
