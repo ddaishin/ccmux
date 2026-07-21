@@ -20,7 +20,16 @@ pub struct Pane {
     last_rows: u16,
     last_cols: u16,
     pub exited: bool,
+    /// Current OSC 0/2 window title. The reader thread keeps this up to date
+    /// for OSC tracking / potential future title display; Claude detection no
+    /// longer reads it directly (it derives `claude_active` from title events).
+    #[allow(dead_code)]
     pub title: Arc<Mutex<String>>,
+    /// Whether Claude Code is currently running in this pane. Set by the
+    /// reader thread via title hysteresis (see `pty_reader_thread`): turned
+    /// on by a Claude title, off by a shell prompt title, held across the
+    /// `<spinner> <session-name>` titles in between. Read by the UI.
+    claude_active: Arc<std::sync::atomic::AtomicBool>,
     pub cwd: PathBuf,
     pub total_scrollback: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -86,10 +95,20 @@ impl Pane {
 
         let parser_clone = Arc::clone(&parser);
         let title_clone = Arc::clone(&pane_title);
+        let claude_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let claude_active_clone = Arc::clone(&claude_active);
         let scrollback_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let scrollback_clone = Arc::clone(&scrollback_counter);
         let reader_handle = thread::spawn(move || {
-            pty_reader_thread(reader, parser_clone, title_clone, scrollback_clone, id, event_tx);
+            pty_reader_thread(
+                reader,
+                parser_clone,
+                title_clone,
+                claude_active_clone,
+                scrollback_clone,
+                id,
+                event_tx,
+            );
         });
 
         let mut pane = Self {
@@ -103,6 +122,7 @@ impl Pane {
             last_cols: cols,
             exited: false,
             title: pane_title,
+            claude_active,
             cwd: work_dir,
             total_scrollback: scrollback_counter,
         };
@@ -237,15 +257,14 @@ impl Pane {
         )
     }
 
-    /// Check if Claude Code is running in this pane (by window title).
+    /// Check if Claude Code is running in this pane.
     ///
-    /// See `title_indicates_claude` for the accepted title formats.
+    /// Returns the hysteresis flag maintained by the reader thread rather than
+    /// re-judging the current title: Claude rewrites its title to
+    /// `<spinner> <session-name>` while running, which `title_indicates_claude`
+    /// alone would not recognise. See `pty_reader_thread` for the state machine.
     pub fn is_claude_running(&self) -> bool {
-        if let Ok(t) = self.title.lock() {
-            title_indicates_claude(&t)
-        } else {
-            false
-        }
+        self.claude_active.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Kill the PTY child process.
@@ -266,6 +285,7 @@ fn pty_reader_thread(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
     title: Arc<Mutex<String>>,
+    claude_active: Arc<std::sync::atomic::AtomicBool>,
     scrollback_count: Arc<std::sync::atomic::AtomicUsize>,
     pane_id: usize,
     event_tx: Sender<AppEvent>,
@@ -291,8 +311,17 @@ fn pty_reader_thread(
                     let _ = event_tx.send(AppEvent::CwdChanged(pane_id, path));
                 }
 
-                // Detect OSC 0/2 (window title) — used to detect Claude Code
+                // Detect OSC 0/2 (window title) — drives Claude Code detection.
                 if let Some(new_title) = extract_osc_title(data) {
+                    // Hysteresis: a Claude title turns detection on; a shell
+                    // prompt title turns it off; the `<spinner> <session-name>`
+                    // titles Claude emits in between leave it unchanged, so a
+                    // named/continued Claude session stays detected.
+                    if title_indicates_claude(&new_title) {
+                        claude_active.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else if title_is_shell_prompt(&new_title) {
+                        claude_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if let Ok(mut t) = title.lock() {
                         *t = new_title;
                     }
@@ -412,7 +441,6 @@ fn title_indicates_claude(title: &str) -> bool {
 ///
 /// This is deliberately Git-Bash-centric (ccmux's primary shell). PowerShell /
 /// custom-prompt titles that match neither are a known gap (see design ADR-2).
-#[allow(dead_code)] // wired into the reader thread's hysteresis in the next commit
 fn title_is_shell_prompt(title: &str) -> bool {
     let lower = title.to_lowercase();
     lower.starts_with("mingw64:")
