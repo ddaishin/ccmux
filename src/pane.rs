@@ -396,6 +396,31 @@ fn title_indicates_claude(title: &str) -> bool {
         || stripped.starts_with("claude \u{b7} ")
 }
 
+/// Check whether a window title is a shell prompt title (i.e. Claude Code is
+/// NOT running here).
+///
+/// Used as the OFF trigger of the Claude-detection hysteresis: once a pane has
+/// been marked as running Claude (via [`title_indicates_claude`]), it stays so
+/// even after Claude rewrites its title to `<spinner> <session-name>`, until a
+/// shell prompt title appears — meaning Claude has exited and the shell is back.
+///
+/// Recognised shell titles (case-insensitive):
+/// - `MINGW64:` / `MINGW32:` / `MSYS:` prefixes — Git Bash / MSYS set these via
+///   `PROMPT_COMMAND` (e.g. `MINGW64:/c/Users/foo`).
+/// - a `.exe` suffix — the PTY's initial title is often the shell executable
+///   path (`C:\Program Files\Git\bin\bash.exe`, `powershell.exe`, `cmd.exe`).
+///
+/// This is deliberately Git-Bash-centric (ccmux's primary shell). PowerShell /
+/// custom-prompt titles that match neither are a known gap (see design ADR-2).
+#[allow(dead_code)] // wired into the reader thread's hysteresis in the next commit
+fn title_is_shell_prompt(title: &str) -> bool {
+    let lower = title.to_lowercase();
+    lower.starts_with("mingw64:")
+        || lower.starts_with("mingw32:")
+        || lower.starts_with("msys:")
+        || lower.ends_with(".exe")
+}
+
 /// Extract window title from OSC 0 or OSC 2: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
 fn extract_osc_title(data: &[u8]) -> Option<String> {
     let s = std::str::from_utf8(data).ok()?;
@@ -515,6 +540,32 @@ mod tests {
         assert!(!title_indicates_claude("claudette"));
         // Leading CJK text is not a spinner glyph and must not be stripped
         assert!(!title_indicates_claude("実行中 claude"));
+    }
+
+    #[test]
+    fn test_title_is_shell_prompt_recognises_shell_titles() {
+        // Git Bash / MSYS PROMPT_COMMAND titles
+        assert!(title_is_shell_prompt("MINGW64:/c/Users/foo"));
+        assert!(title_is_shell_prompt("MINGW32:/c/Users/foo"));
+        assert!(title_is_shell_prompt("MSYS:/c/Users/foo"));
+        // Initial PTY title = shell executable path
+        assert!(title_is_shell_prompt("C:\\Program Files\\Git\\bin\\bash.exe"));
+        assert!(title_is_shell_prompt("powershell.exe"));
+        assert!(title_is_shell_prompt("cmd.exe"));
+    }
+
+    #[test]
+    fn test_title_is_shell_prompt_rejects_claude_and_session_names() {
+        // Claude titles must NOT be seen as shell (would break the OFF trigger)
+        assert!(!title_is_shell_prompt("claude"));
+        assert!(!title_is_shell_prompt("✳ Claude Code"));
+        assert!(!title_is_shell_prompt("claude · resume"));
+        // Session/topic names claude rewrites the title to — must be "held"
+        // (neither claude nor shell), so title_is_shell_prompt is false.
+        assert!(!title_is_shell_prompt("✳ ccmux-display-optimization"));
+        assert!(!title_is_shell_prompt("⠂ ccmux-display-optimization"));
+        // Empty title is not a shell prompt
+        assert!(!title_is_shell_prompt(""));
     }
 
     #[test]
