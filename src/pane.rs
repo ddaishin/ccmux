@@ -313,14 +313,13 @@ fn pty_reader_thread(
 
                 // Detect OSC 0/2 (window title) — drives Claude Code detection.
                 if let Some(new_title) = extract_osc_title(data) {
-                    // Hysteresis: a Claude title turns detection on; a shell
-                    // prompt title turns it off; the `<spinner> <session-name>`
-                    // titles Claude emits in between leave it unchanged, so a
-                    // named/continued Claude session stays detected.
-                    if title_indicates_claude(&new_title) {
-                        claude_active.store(true, std::sync::atomic::Ordering::Relaxed);
-                    } else if title_is_shell_prompt(&new_title) {
-                        claude_active.store(false, std::sync::atomic::Ordering::Relaxed);
+                    // Hysteresis (see `next_claude_active`): held across the
+                    // `<spinner> <session-name>` titles so a named/continued
+                    // Claude session stays detected.
+                    let prev = claude_active.load(std::sync::atomic::Ordering::Relaxed);
+                    let next = next_claude_active(prev, &new_title);
+                    if next != prev {
+                        claude_active.store(next, std::sync::atomic::Ordering::Relaxed);
                     }
                     if let Ok(mut t) = title.lock() {
                         *t = new_title;
@@ -447,6 +446,25 @@ fn title_is_shell_prompt(title: &str) -> bool {
         || lower.starts_with("mingw32:")
         || lower.starts_with("msys:")
         || lower.ends_with(".exe")
+}
+
+/// Hysteresis transition for Claude-Code detection, given the current state and
+/// a newly observed window title:
+/// - a Claude title turns it **on** (start of a session);
+/// - a shell prompt title turns it **off** (Claude exited, shell is back);
+/// - anything else (the `<spinner> <session-name>` titles Claude emits while
+///   running, or an unrelated app's title) leaves the state **unchanged**.
+///
+/// Because only a Claude title can turn it on, a pane that has never shown a
+/// Claude title stays off even while displaying a session-name-like title.
+fn next_claude_active(current: bool, new_title: &str) -> bool {
+    if title_indicates_claude(new_title) {
+        true
+    } else if title_is_shell_prompt(new_title) {
+        false
+    } else {
+        current
+    }
 }
 
 /// Extract window title from OSC 0 or OSC 2: \x1b]0;TITLE\x07 or \x1b]2;TITLE\x07
@@ -580,6 +598,29 @@ mod tests {
         assert!(title_is_shell_prompt("C:\\Program Files\\Git\\bin\\bash.exe"));
         assert!(title_is_shell_prompt("powershell.exe"));
         assert!(title_is_shell_prompt("cmd.exe"));
+    }
+
+    #[test]
+    fn test_next_claude_active_hysteresis() {
+        // ON: a Claude title starts detection regardless of prior state.
+        assert!(next_claude_active(false, "claude"));
+        assert!(next_claude_active(false, "✳ Claude Code"));
+        assert!(next_claude_active(true, "claude"));
+
+        // HELD: session-name / spinner titles keep the current state — this is
+        // the core fix (a named/continued session stays detected).
+        assert!(next_claude_active(true, "✳ ccmux-display-optimization"));
+        assert!(next_claude_active(true, "⠂ ccmux-display-optimization"));
+        assert!(next_claude_active(true, "")); // empty title: unchanged
+
+        // OFF: a shell prompt title ends detection (Claude exited).
+        assert!(!next_claude_active(true, "MINGW64:/c/Users/foo"));
+        assert!(!next_claude_active(true, "C:\\Program Files\\Git\\bin\\bash.exe"));
+
+        // Stays OFF: a pane that never showed a Claude title is not turned on
+        // by a session-name-like title (prevents false positives).
+        assert!(!next_claude_active(false, "✳ ccmux-display-optimization"));
+        assert!(!next_claude_active(false, "MINGW64:/c/Users/foo"));
     }
 
     #[test]
