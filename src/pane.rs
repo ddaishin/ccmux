@@ -435,8 +435,11 @@ fn title_indicates_claude(title: &str) -> bool {
 /// Recognised shell titles (case-insensitive):
 /// - `MINGW64:` / `MINGW32:` / `MSYS:` prefixes — Git Bash / MSYS set these via
 ///   `PROMPT_COMMAND` (e.g. `MINGW64:/c/Users/foo`).
-/// - a `.exe` suffix — the PTY's initial title is often the shell executable
-///   path (`C:\Program Files\Git\bin\bash.exe`, `powershell.exe`, `cmd.exe`).
+/// - a known shell-executable name suffix (`bash.exe` / `powershell.exe` /
+///   `pwsh.exe` / `cmd.exe`) — the PTY's initial title is often the shell exe
+///   path (`C:\Program Files\Git\bin\bash.exe`). Restricted to specific shell
+///   exes so that a Claude session/topic name merely ending in `.exe` (e.g.
+///   `✳ fix build.exe`) is NOT mistaken for a shell prompt.
 ///
 /// This is deliberately Git-Bash-centric (ccmux's primary shell). PowerShell /
 /// custom-prompt titles that match neither are a known gap (see design ADR-2).
@@ -445,7 +448,10 @@ fn title_is_shell_prompt(title: &str) -> bool {
     lower.starts_with("mingw64:")
         || lower.starts_with("mingw32:")
         || lower.starts_with("msys:")
-        || lower.ends_with(".exe")
+        || lower.ends_with("bash.exe")
+        || lower.ends_with("powershell.exe")
+        || lower.ends_with("pwsh.exe")
+        || lower.ends_with("cmd.exe")
 }
 
 /// Hysteresis transition for Claude-Code detection, given the current state and
@@ -621,6 +627,32 @@ mod tests {
         // by a session-name-like title (prevents false positives).
         assert!(!next_claude_active(false, "✳ ccmux-display-optimization"));
         assert!(!next_claude_active(false, "MINGW64:/c/Users/foo"));
+
+        // HELD across a session/topic name that merely ends in ".exe": only
+        // known shell exes count as shell prompts, so this stays detected.
+        assert!(next_claude_active(true, "✳ fix build.exe"));
+    }
+
+    #[test]
+    fn test_claude_active_full_lifecycle() {
+        // A realistic sequence of title events from pane start through a named
+        // Claude session and back to the shell.
+        let steps: &[(&str, bool)] = &[
+            ("C:\\Program Files\\Git\\bin\\bash.exe", false), // shell spawn
+            ("MINGW64:/c/Users/foo", false),                 // shell prompt
+            ("claude", true),                                // claude starts
+            ("✳ Claude Code", true),                         // UI up (unnamed)
+            ("✳ my-session", true),                          // renamed: held
+            ("⠂ my-session", true),                          // spinner: held
+            ("⠐ my-session", true),                          // spinner: held
+            ("MINGW64:/c/Users/foo", false),                 // claude exits
+            ("MINGW64:/c/Users/foo", false),                 // stays off
+        ];
+        let mut active = false;
+        for &(title, expected) in steps {
+            active = next_claude_active(active, title);
+            assert_eq!(active, expected, "after title {:?}", title);
+        }
     }
 
     #[test]
