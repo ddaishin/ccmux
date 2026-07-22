@@ -35,7 +35,9 @@ pub struct Opener {
 }
 
 /// scrollback_lines の既定値(ペインごとの vt100 スクロールバック行数)。
-const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+/// 旧来の 10,000 行は満杯時 ≈38MB/ペイン(120 桁換算)とメモリ支配項
+/// だったため 2,000 行(≈7.7MB)に変更。長い履歴が必要なら config.toml で戻せる。
+const DEFAULT_SCROLLBACK_LINES: usize = 2_000;
 /// scrollback_lines の上限。120 桁 × 32byte/セル換算で約 384MB/ペインに
 /// 相当するため、これを超える指定はサイレントにクランプする。
 const MAX_SCROLLBACK_LINES: usize = 100_000;
@@ -173,10 +175,10 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 #command = "code.cmd"
 #args = ["{file}"]
 
-# scrollback_lines = ペインごとのスクロールバック行数。既定 10000。
+# scrollback_lines = ペインごとのスクロールバック行数。既定 2000。
 # 0 で履歴なし。上限 100000(超過分は切り詰め)。反映は再起動時。
 # メモリ目安: 行数 × 画面桁数 × 32byte がペインごとの上限
-#scrollback_lines = 10000
+#scrollback_lines = 2000
 "##;
 
 /// path に設定ファイルの雛形を生成する(初回起動時)。

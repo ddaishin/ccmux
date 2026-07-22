@@ -25,7 +25,7 @@
 #command = "code.cmd"
 #args = ["{file}"]
 
-# scrollback_lines = ペインごとのスクロールバック行数。既定 10000。
+# scrollback_lines = ペインごとのスクロールバック行数。既定 2000。
 # 0 で履歴なし。上限 100000(超過分は切り詰め)。反映は再起動時。
 # メモリ目安: 行数 × 画面桁数 × 32byte がペインごとの上限
-#scrollback_lines = 10000
+#scrollback_lines = 2000
