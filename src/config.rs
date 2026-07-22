@@ -34,11 +34,36 @@ pub struct Opener {
     pub args: Vec<String>,
 }
 
+/// scrollback_lines の既定値(ペインごとの vt100 スクロールバック行数)。
+const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+/// scrollback_lines の上限。120 桁 × 32byte/セル換算で約 384MB/ペインに
+/// 相当するため、これを超える指定はサイレントにクランプする。
+const MAX_SCROLLBACK_LINES: usize = 100_000;
+
+fn default_scrollback_lines() -> usize {
+    DEFAULT_SCROLLBACK_LINES
+}
+
 /// ccmux のユーザー設定。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub openers: Vec<Opener>,
+    /// ペインごとのスクロールバック行数。0 は履歴なし。
+    /// vt100 Parser 生成時に固定されるため反映は起動時のみ。
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: usize,
+}
+
+// derive(Default) だと scrollback_lines が 0 になり serde の
+// default(= DEFAULT_SCROLLBACK_LINES)と食い違うため手書きで一致させる。
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            openers: Vec::new(),
+            scrollback_lines: default_scrollback_lines(),
+        }
+    }
 }
 
 impl Config {
@@ -71,10 +96,17 @@ impl Config {
     /// Windows のエディタが付ける UTF-8 BOM は除去してから渡す。
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        toml::from_str::<Self>(text).map_err(|e| {
-            // toml のエラーは複数行になるためステータスバー向けに先頭行だけ残す
-            e.to_string().lines().next().unwrap_or("parse error").to_string()
-        })
+        toml::from_str::<Self>(text)
+            .map(|mut cfg: Self| {
+                // 極端な値はサイレントにクランプ(負値・型不一致は toml 側で
+                // Err になり、load の fail-open 経路で既定値+警告に落ちる)。
+                cfg.scrollback_lines = cfg.scrollback_lines.min(MAX_SCROLLBACK_LINES);
+                cfg
+            })
+            .map_err(|e| {
+                // toml のエラーは複数行になるためステータスバー向けに先頭行だけ残す
+                e.to_string().lines().next().unwrap_or("parse error").to_string()
+            })
     }
 
     /// path の拡張子に対応するオープナーを返す(小文字化して比較)。
@@ -140,6 +172,11 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 #extensions = ["md", "markdown"]
 #command = "code.cmd"
 #args = ["{file}"]
+
+# scrollback_lines = ペインごとのスクロールバック行数。既定 10000。
+# 0 で履歴なし。上限 100000(超過分は切り詰め)。反映は再起動時。
+# メモリ目安: 行数 × 画面桁数 × 32byte がペインごとの上限
+#scrollback_lines = 10000
 "##;
 
 /// path に設定ファイルの雛形を生成する(初回起動時)。
@@ -212,14 +249,14 @@ mod tests {
 
     #[test]
     fn test_find_opener_case_insensitive() {
-        let cfg = Config { openers: vec![opener(&["md"], &[])] };
+        let cfg = Config { openers: vec![opener(&["md"], &[])], ..Default::default() };
         assert!(cfg.find_opener(Path::new("README.MD")).is_some());
         assert!(cfg.find_opener(Path::new("note.Md")).is_some());
     }
 
     #[test]
     fn test_find_opener_unregistered_or_no_ext() {
-        let cfg = Config { openers: vec![opener(&["md"], &[])] };
+        let cfg = Config { openers: vec![opener(&["md"], &[])], ..Default::default() };
         assert!(cfg.find_opener(Path::new("main.rs")).is_none());
         assert!(cfg.find_opener(Path::new("Makefile")).is_none());
     }
@@ -242,6 +279,41 @@ mod tests {
     fn test_config_skel_parses_to_empty() {
         let cfg = Config::parse(CONFIG_SKEL).unwrap();
         assert!(cfg.openers.is_empty());
+        // 全コメントの雛形は既定値(=Default)と等価であること
+        assert_eq!(cfg.scrollback_lines, Config::default().scrollback_lines);
+    }
+
+    #[test]
+    fn test_scrollback_lines_default_when_missing() {
+        let cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.scrollback_lines, DEFAULT_SCROLLBACK_LINES);
+    }
+
+    #[test]
+    fn test_scrollback_lines_explicit_value() {
+        let cfg = Config::parse("scrollback_lines = 5000").unwrap();
+        assert_eq!(cfg.scrollback_lines, 5000);
+    }
+
+    #[test]
+    fn test_scrollback_lines_zero_allowed() {
+        let cfg = Config::parse("scrollback_lines = 0").unwrap();
+        assert_eq!(cfg.scrollback_lines, 0);
+    }
+
+    #[test]
+    fn test_scrollback_lines_clamped_to_max() {
+        let cfg = Config::parse("scrollback_lines = 100001").unwrap();
+        assert_eq!(cfg.scrollback_lines, MAX_SCROLLBACK_LINES);
+    }
+
+    #[test]
+    fn test_scrollback_lines_negative_is_parse_err() {
+        // 負値は usize へのデシリアライズエラー → load 側の fail-open 経路
+        // (既定値+ステータス警告)に乗る。ここでは Err になることを確認。
+        let err = Config::parse("scrollback_lines = -1").unwrap_err();
+        assert!(!err.is_empty());
+        assert!(!err.contains('\n'));
     }
 
     #[test]

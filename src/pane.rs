@@ -36,11 +36,11 @@ pub struct Pane {
 
 impl Pane {
     /// Create a new pane with a PTY shell.
-    pub fn new(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>) -> Result<Self> {
-        Self::new_with_cwd(id, rows, cols, event_tx, None)
+    pub fn new(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>, scrollback: usize) -> Result<Self> {
+        Self::new_with_cwd(id, rows, cols, event_tx, None, scrollback)
     }
 
-    pub fn new_with_cwd(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>, cwd: Option<PathBuf>) -> Result<Self> {
+    pub fn new_with_cwd(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>, cwd: Option<PathBuf>, scrollback: usize) -> Result<Self> {
         let pty_system = native_pty_system();
 
         let pty_size = PtySize {
@@ -84,8 +84,9 @@ impl Pane {
             .take_writer()
             .context("Failed to take PTY writer")?;
 
-        // Scrollback buffer: 10000 lines of history
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 10000)));
+        // Scrollback buffer: line count comes from config.toml
+        // (scrollback_lines), fixed for the lifetime of the parser.
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, scrollback)));
         let pane_title = Arc::new(Mutex::new(String::new()));
 
         let reader = pair

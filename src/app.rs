@@ -393,8 +393,9 @@ impl Workspace {
         rows: u16,
         cols: u16,
         event_tx: Sender<AppEvent>,
+        scrollback: usize,
     ) -> Result<Self> {
-        let pane = Pane::new(pane_id, rows, cols, event_tx)?;
+        let pane = Pane::new(pane_id, rows, cols, event_tx, scrollback)?;
         let mut panes = HashMap::new();
         panes.insert(pane_id, pane);
 
@@ -494,7 +495,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(rows: u16, cols: u16) -> Result<Self> {
+    pub fn new(rows: u16, cols: u16, config: crate::config::Config) -> Result<Self> {
         let (event_tx, event_rx) = mpsc::channel();
 
         let pane_rows = rows.saturating_sub(5); // title + tab bar + status + borders
@@ -503,7 +504,15 @@ impl App {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let name = dir_name(&cwd);
 
-        let ws = Workspace::new(name, cwd, 1, pane_rows, pane_cols, event_tx.clone())?;
+        let ws = Workspace::new(
+            name,
+            cwd,
+            1,
+            pane_rows,
+            pane_cols,
+            event_tx.clone(),
+            config.scrollback_lines,
+        )?;
 
         Ok(Self {
             workspaces: vec![ws],
@@ -535,7 +544,7 @@ impl App {
             claude_monitor: crate::claude_monitor::ClaudeMonitor::new(),
             clipboard: None,
             image_picker: None,
-            config: crate::config::Config::default(),
+            config,
             status_message: None,
         })
     }
@@ -1020,7 +1029,15 @@ impl App {
         let pane_id = self.next_pane_id;
         self.next_pane_id = self.next_pane_id.wrapping_add(1);
 
-        let ws = Workspace::new(name, cwd, pane_id, 10, 40, self.event_tx.clone())?;
+        let ws = Workspace::new(
+            name,
+            cwd,
+            pane_id,
+            10,
+            40,
+            self.event_tx.clone(),
+            self.config.scrollback_lines,
+        )?;
         self.workspaces.push(ws);
         self.active_tab = self.workspaces.len() - 1;
         Ok(())
@@ -1110,7 +1127,14 @@ impl App {
         let parent_cwd = self.ws().panes.get(&self.ws().focused_pane_id)
             .map(|p| p.cwd.clone());
 
-        let pane = Pane::new_with_cwd(new_id, 10, 40, self.event_tx.clone(), parent_cwd)?;
+        let pane = Pane::new_with_cwd(
+            new_id,
+            10,
+            40,
+            self.event_tx.clone(),
+            parent_cwd,
+            self.config.scrollback_lines,
+        )?;
         let ws = self.ws_mut();
         ws.panes.insert(new_id, pane);
         ws.layout.split_pane(ws.focused_pane_id, new_id, direction);

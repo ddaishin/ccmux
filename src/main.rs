@@ -51,6 +51,11 @@ fn main() -> Result<()> {
         default_hook(info);
     }));
 
+    // User config (fail-open: parse failures surface as a status
+    // message and the app continues with defaults). Loaded BEFORE
+    // App::new because the initial pane's scrollback size comes from it.
+    let (config, config_warning) = config::Config::load();
+
     // Query terminal for graphics protocol support BEFORE raw mode.
     // Falls back to halfblocks if detection fails.
     let image_picker = Some(
@@ -72,12 +77,8 @@ fn main() -> Result<()> {
     let size = terminal.size()?;
 
     // Create app
-    let mut app = app::App::new(size.height, size.width)?;
+    let mut app = app::App::new(size.height, size.width, config)?;
     app.image_picker = image_picker;
-    // User config (fail-open: parse failures surface as a status
-    // message and the app continues with defaults).
-    let (config, config_warning) = config::Config::load();
-    app.config = config;
     app.status_message = config_warning;
 
     // Main event loop
