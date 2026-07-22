@@ -34,8 +34,15 @@ pub struct Preview {
     pub is_binary: bool,
     /// Image preview state (set when an image file is loaded).
     pub image_protocol: Option<StatefulProtocol>,
-    syntax_set: SyntaxSet,
-    theme_set: ThemeSet,
+}
+
+/// Process-wide shared syntect assets, loaded lazily on the first text
+/// preview. Workspace ごとに Preview が作られるため、インスタンス保持だと
+/// タブ数分だけ SyntaxSet/ThemeSet が複製され、プレビュー未使用でも
+/// 起動時にロードされてしまう(footprint 施策 T8)。
+fn highlight_assets() -> &'static (SyntaxSet, ThemeSet) {
+    static ASSETS: std::sync::OnceLock<(SyntaxSet, ThemeSet)> = std::sync::OnceLock::new();
+    ASSETS.get_or_init(|| (SyntaxSet::load_defaults_newlines(), ThemeSet::load_defaults()))
 }
 
 impl Preview {
@@ -48,8 +55,6 @@ impl Preview {
             h_scroll_offset: 0,
             is_binary: false,
             image_protocol: None,
-            syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: ThemeSet::load_defaults(),
         }
     }
 
@@ -192,21 +197,21 @@ impl Preview {
 
     /// Apply syntax highlighting to loaded lines.
     fn highlight(&mut self, path: &Path) {
-        let syntax = self
-            .syntax_set
+        let (syntax_set, theme_set) = highlight_assets();
+        let syntax = syntax_set
             .find_syntax_for_file(path)
             .ok()
             .flatten()
-            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+            .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
 
-        let theme = &self.theme_set.themes["base16-eighties.dark"];
+        let theme = &theme_set.themes["base16-eighties.dark"];
         let mut highlighter = HighlightLines::new(syntax, theme);
 
         self.highlighted_lines.clear();
 
         for line in &self.lines {
             let line_with_newline = format!("{}\n", line);
-            match highlighter.highlight_line(&line_with_newline, &self.syntax_set) {
+            match highlighter.highlight_line(&line_with_newline, syntax_set) {
                 Ok(ranges) => {
                     let spans: Vec<StyledSpan> = ranges
                         .into_iter()
