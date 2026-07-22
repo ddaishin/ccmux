@@ -37,6 +37,11 @@
 
 ## 不採用判断の記録
 
+- **T4: syntect regex-fancy 化(onig 除去)**: `cargo tree -i onig` 空・テスト green まで確認したが、
+  exe が 3,839,488 → 4,493,312 bytes に**+654KB 増加**したため不採用(判断軸 A)。fancy-regex/regex の
+  Rust コード(単形化+Unicode テーブル)が onig の C オブジェクトコードより大きい。opt-level="s" は
+  Rust 側のみに効き、cc crate 経由の C 側は独立に最適化されているため C 排除がサイズ増になる
+
 - **ureq "json" feature 外し**: serde_json が直接依存(claude_monitor 等)で残るため削減効果ほぼゼロ。
   version_check.rs の書き換えコストのみ発生するため不採用(設計 ADR-5)
 - **毎フレームアロケーション削減**: 描画セルループ(ui.rs:505-547)は既にアロケーションフリー。
