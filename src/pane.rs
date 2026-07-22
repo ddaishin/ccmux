@@ -32,6 +32,10 @@ pub struct Pane {
     claude_active: Arc<std::sync::atomic::AtomicBool>,
     pub cwd: PathBuf,
     pub total_scrollback: Arc<std::sync::atomic::AtomicUsize>,
+    /// vt100 Parser 生成時の scrollback 行数(config の scrollback_lines)。
+    /// total_scrollback は累積 newline カウンタで実バッファ容量を超えて
+    /// 増え続けるため、スクロールバー推定はこの値でキャップする。
+    scrollback_limit: usize,
 }
 
 impl Pane {
@@ -126,6 +130,7 @@ impl Pane {
             claude_active,
             cwd: work_dir,
             total_scrollback: scrollback_counter,
+            scrollback_limit: scrollback,
         };
 
         // Inject OSC 7 hook after shell starts
@@ -210,8 +215,13 @@ impl Pane {
         let screen = parser.screen();
         let current = screen.scrollback();
         // Estimate max by checking: set_scrollback clamps to actual scrollback length
-        // We can't query it directly, so use the stored total_scrollback as estimate
-        let total = self.total_scrollback.load(std::sync::atomic::Ordering::Relaxed);
+        // We can't query it directly, so use the stored total_scrollback as estimate.
+        // The counter keeps growing past the ring buffer's capacity, so cap it at
+        // the configured limit (scrollback_lines = 0 then hides the scrollbar).
+        let total = self
+            .total_scrollback
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(self.scrollback_limit);
         (current, total)
     }
 
