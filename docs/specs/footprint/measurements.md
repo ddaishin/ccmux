@@ -38,6 +38,23 @@
 | T7 既定 2000 へ | 3,839,488 | ±0 | S2 Private 11,046,912(T6 比 **−28.4MB**)・WS 49.7→22.1MB。理論値 30.7MB と整合 |
 | T8 syntect OnceLock 化 | 3,839,488 | ±0 | T7 バイナリ比: S1 Private 3,551,232→2,875,392(−0.7MB)・S3 5,337,088→3,608,576(−1.7MB) |
 
+## 最終結果(T9 総括: ベースライン → T8 最終バイナリ)
+
+| 指標 | before | after | Δ |
+|---|---|---|---|
+| exe サイズ | 6,297,600 | **3,839,488** | **−39.0%** |
+| S1 idle WS / Private | 19.25MB / 3.58MB | 13.94MB / 2.97MB | −27.6% / −17.1% |
+| S2 scrollback WS / Private | 50.58MB / 39.22MB | **21.03MB / 10.39MB** | **−58.4% / −73.5%** |
+| S3 tabs WS / Private | 17.77MB / 5.44MB | 14.55MB / 3.60MB | −18.1% / −33.9% |
+| perf: draw_us 中央値(pty) | 1,264µs(基準) | 1,025µs | −18.9%(改善) |
+| perf: latency p90 | 16,853µs(基準) | 18,078µs | +7.3%(+10% ゲート内) |
+| perf: latency 中央値 | 15,937µs(基準) | 15,431µs | −3.2%(60fps ペーシング下限) |
+
+- メモリの主効果は scrollback 既定 10,000→2,000(S2 で −28.4MB)と syntect の
+  OnceLock 共有・遅延化(S1 −0.7MB / S3 −1.7MB)
+- サイズの主効果は profile 設定(lto fat + cu=1 + strip + panic=abort + opt-level "s")
+- 従来挙動が必要な場合: config.toml に `scrollback_lines = 10000`
+
 ## 不採用判断の記録
 
 - **T4: syntect regex-fancy 化(onig 除去)**: `cargo tree -i onig` 空・テスト green まで確認したが、
