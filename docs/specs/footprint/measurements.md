@@ -41,6 +41,11 @@
   exe が 3,839,488 → 4,493,312 bytes に**+654KB 増加**したため不採用(判断軸 A)。fancy-regex/regex の
   Rust コード(単形化+Unicode テーブル)が onig の C オブジェクトコードより大きい。opt-level="s" は
   Rust 側のみに効き、cc crate 経由の C 側は独立に最適化されているため C 排除がサイズ増になる
+- **T5: arboard/ratatui feature 削減**: `default-features=false`(arboard: image-data 除去 /
+  ratatui: all-widgets・macros 除去)でビルド・テスト green だが exe は 3,839,488 bytes で**変化なし**
+  (±512B のビルドノイズのみ)。lto="fat"+strip が未使用コード(calendar/macros/GDI 画像変換)を
+  既にリンカレベルで除去済みのため feature 削減の上乗せ効果ゼロ。time も syntect(onig 構成)→plist
+  経由で残存するため除去不能。upstream との diff 最小化を優先し revert・不採用(判断軸 A・D)
 
 - **ureq "json" feature 外し**: serde_json が直接依存(claude_monitor 等)で残るため削減効果ほぼゼロ。
   version_check.rs の書き換えコストのみ発生するため不採用(設計 ADR-5)
