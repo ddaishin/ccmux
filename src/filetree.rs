@@ -190,7 +190,8 @@ impl FileTree {
     }
 
     /// Get the currently selected entry.
-    #[allow(dead_code)]
+    /// Unlike `toggle_or_select`, this also returns directories — the `o`
+    /// key opens whatever is selected in the OS default handler.
     pub fn selected_entry(&self) -> Option<&FlatEntry> {
         self.flat_entries.get(self.selected_index)
     }

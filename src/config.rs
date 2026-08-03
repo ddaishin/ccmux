@@ -19,19 +19,70 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// オープナーの起動方式。
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenerMode {
+    /// `command` を直接 spawn する(既定。従来どおりの挙動)。
+    #[default]
+    Command,
+    /// OS の既定アプリに委ねる。`command` / `args` は使わない。
+    /// ストアアプリ(MSIX)のようにインストールパスへバージョン番号が
+    /// 入るアプリを、パスを書かずに起動するための方式。
+    Default,
+}
+
 /// 拡張子と外部コマンドの対応 1 件(config.toml の [[openers]])。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Opener {
     /// 対象拡張子(ドットなし)。比較は小文字化して行う。
-    /// 複合拡張子は不可: "tar.gz" ではなく "gz" と書く
-    /// (判定は Path::extension() = 最後のドット以降のみ)。
+    /// 判定はファイル名の末尾一致(ドット境界)なので "tar.gz" のような
+    /// 複合拡張子も書ける。より長い一致が優先される。
+    #[serde(default)]
     pub extensions: Vec<String>,
+    /// 拡張子を持たないファイル(Makefile 等)向けの完全一致名。
+    /// 小文字化して比較し、extensions のどのマッチよりも優先される。
+    #[serde(default)]
+    pub filenames: Vec<String>,
     /// 起動コマンド。PATH 解決は OS に任せる(シェルは経由しない)。
-    pub command: String,
+    /// mode = "default" では不要。
+    #[serde(default)]
+    pub command: Option<String>,
+    /// 起動方式。省略時は command 方式(従来の挙動)。
+    #[serde(default)]
+    pub mode: OpenerMode,
     /// 引数。"{file}" は対象ファイルの絶対パスに置換され、
     /// どの引数にも現れない場合は末尾に自動付加される。
+    /// mode = "default" では無視される。
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+impl Opener {
+    /// 起動に使えるオープナーか。mode = "command" なのに command が
+    /// 書かれていない設定は spawn しようがないためマッチ対象から外す。
+    pub fn is_usable(&self) -> bool {
+        self.mode == OpenerMode::Default || self.command.is_some()
+    }
+
+    /// 小文字化済みファイル名に対するマッチ強度(大きいほど優先)。
+    /// None は非マッチ。filenames の完全一致を最優先とし、extensions は
+    /// ".<ext>" での末尾一致(ドット境界)にマッチした最長の拡張子長を返す。
+    /// ドット境界を要求するので "atar.gz" は "tar.gz" にマッチしない。
+    fn match_score(&self, lower_name: &str) -> Option<usize> {
+        if self.filenames.iter().any(|f| f.to_lowercase() == lower_name) {
+            return Some(usize::MAX);
+        }
+        // 判定とスコアを同じ小文字化結果から取る(大文字小文字で
+        // 長さが変わる文字を書かれてもスコアが実際の一致長とずれない)
+        self.extensions
+            .iter()
+            .filter_map(|e| {
+                let e = e.to_lowercase();
+                lower_name.ends_with(&format!(".{}", e)).then(|| e.chars().count())
+            })
+            .max()
+    }
 }
 
 /// scrollback_lines の既定値(ペインごとの vt100 スクロールバック行数)。
@@ -70,7 +121,8 @@ impl Default for Config {
 
 impl Config {
     /// 設定ファイルを読み込む。戻り値の .1 は起動を止めない一時
-    /// メッセージ(パース失敗の警告、または初回の雛形生成通知)。
+    /// メッセージ(パース失敗の警告 / 初回の雛形生成通知 /
+    /// command 未指定オープナーを無視した旨の警告)。
     /// ファイル不在時は全コメントの雛形を生成して通知を返し(失敗時は
     /// 無通知)、NotFound 以外の読み取りエラーは空設定・無通知で継続。
     pub fn load() -> (Self, Option<String>) {
@@ -79,7 +131,11 @@ impl Config {
         };
         match std::fs::read_to_string(&path) {
             Ok(text) => match Self::parse(&text) {
-                Ok(cfg) => (cfg, None),
+                Ok(cfg) => {
+                    // 設定は読めたが起動不能なオープナーがあれば併せて通知する
+                    let warning = cfg.unusable_opener_warning();
+                    (cfg, warning)
+                }
                 Err(e) => (
                     Self::default(),
                     Some(format!("config.toml 読み込み失敗(設定を無視して継続): {}", e)),
@@ -111,17 +167,49 @@ impl Config {
             })
     }
 
-    /// path の拡張子に対応するオープナーを返す(小文字化して比較)。
+    /// path に対応するオープナーを返す。マッチ強度が最大のものを選び、
+    /// 同点なら config.toml の記述順で先に書かれた方を採る。
+    /// (filenames 完全一致 > より長い extensions 一致 > 記述順)
     pub fn find_opener(&self, path: &Path) -> Option<&Opener> {
-        let ext = path.extension()?.to_str()?.to_lowercase();
-        self.openers
-            .iter()
-            .find(|o| o.extensions.iter().any(|e| e.to_lowercase() == ext))
+        let name = path.file_name()?.to_str()?.to_lowercase();
+        let mut best: Option<(usize, &Opener)> = None;
+        for o in self.openers.iter().filter(|o| o.is_usable()) {
+            let Some(score) = o.match_score(&name) else {
+                continue;
+            };
+            if best.is_none_or(|(prev, _)| score > prev) {
+                best = Some((score, o));
+            }
+        }
+        best.map(|(_, o)| o)
+    }
+
+    /// 実行中の再読み込み(`r` キー)で差し替えてよいフィールドだけを適用する。
+    ///
+    /// `scrollback_lines` を差し替えてはならない。この値は vt100 Parser の
+    /// 生成時に固定されるが、Parser を作るのは起動時だけでなく新タブ・
+    /// ペイン分割のたびであり、そこで `self.config` から読まれる。構造体ごと
+    /// 差し替えると「反映は再起動時」と案内しているのに新規ペインだけ新しい
+    /// 値になり、同一セッション内でペインごとに履歴長が食い違う。
+    /// リロード対象を増やすときは必ずこのメソッドに追加すること。
+    pub fn apply_reload(&mut self, new: Self) {
+        self.openers = new.openers;
+    }
+
+    /// command 未指定で無視したオープナーがあれば警告文を返す。
+    /// 設定ミスを黙って無視しないための通知で、起動は止めない。
+    pub fn unusable_opener_warning(&self) -> Option<String> {
+        let n = self.openers.iter().filter(|o| !o.is_usable()).count();
+        // 呼び出し側("config.toml 再読み込み: …" 等)と語を重ねないよう
+        // ファイル名は含めない
+        (n > 0).then(|| format!("command 未指定のオープナー {} 件を無視しました", n))
     }
 }
 
-/// オープナーの args を実引数へ展開する。"{file}" を abs_path に置換し、
-/// どの引数にも現れない場合は末尾に付加する。
+/// オープナーの args を実引数へ展開する(mode = "command" 専用)。
+/// "{file}" を abs_path に置換し、どの引数にも現れない場合は末尾に付加する。
+/// mode = "default" では OS ランチャに追加引数を渡す意味がないため
+/// 呼び出し側で分岐し、この関数は通らない。
 pub fn build_args(opener: &Opener, abs_path: &str) -> Vec<String> {
     let mut replaced = false;
     let mut out: Vec<String> = opener
@@ -142,7 +230,7 @@ pub fn build_args(opener: &Opener, abs_path: &str) -> Vec<String> {
     out
 }
 
-fn config_path() -> Option<PathBuf> {
+pub(crate) fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("ccmux").join("config.toml"))
 }
 
@@ -152,31 +240,46 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 # (このファイルは初回起動時に自動生成された雛形です。すべてコメントのため
 #  そのままでは何も変わりません。必要な設定のコメントを外して使ってください)
 #
-# [[openers]] = 拡張子別・外部オープナー設定(複数書けます)。
-# ファイルツリーで選択(Enter / クリック)したファイルの拡張子がマッチすると
-# 外部アプリで開きます。未登録拡張子・起動失敗時は従来どおり TUI プレビュー。
+# [[openers]] = ファイル別・外部オープナー設定(複数書けます)。
+# ファイルツリーで選択(Enter / クリック)したファイルがマッチすると外部アプリで
+# 開きます。未登録・起動失敗時は従来どおり TUI プレビュー。
 #
-# 注意:
-# - 拡張子はドットなし・複合拡張子不可("tar.gz" ではなく "gz")
-# - Windows の .cmd シム(VS Code 等)は "code.cmd" のように拡張子まで書く
-# - {file} は対象ファイルの絶対パスに置換。省略時は末尾に自動付加
-# - ストアアプリ(MSIX)を直接パスで指定する場合、パスにバージョン番号が
-#   含まれるためアプリ更新で壊れる → その際はパスを更新すること
+# ファイルツリーのキー:
+#   o = この設定に関係なく OS の既定アプリで開く(ディレクトリも可)
+#   r = このファイルを再読み込み([[openers]] のみ反映)
+#
+# マッチの書き方:
+# - extensions はドットなし。ファイル名の末尾一致(ドット境界)なので
+#   "tar.gz" のような複合拡張子も書けます。より長い一致が優先されます
+# - filenames は拡張子を持たないファイル用の完全一致("Makefile" 等)。
+#   extensions のどのマッチよりも優先されます
+# - 大文字小文字は区別しません
+#
+# 起動方式(mode):
+# - mode 省略 = command を直接起動。{file} は絶対パスに置換(省略時は末尾に付加)
+# - mode = "default" = OS の既定アプリに委ねる(command / args は不要・無視)。
+#   ストアアプリ(MSIX)はインストールパスにバージョン番号が入り、アプリ更新の
+#   たびに直接パス指定が壊れるため、パスを書かずにこちらを使ってください
 
-# 例1: Markdown を Typora で開く
+# 例1: Markdown を OS の既定アプリで開く(ストアアプリはこの方式が安全)
 #[[openers]]
 #extensions = ["md", "markdown"]
-#command = "typora"
-#args = ["{file}"]
+#mode = "default"
 
 # 例2: Markdown を VS Code で開く
+# (Windows の .cmd シム(VS Code 等)は "code.cmd" のように拡張子まで書く)
 #[[openers]]
 #extensions = ["md", "markdown"]
 #command = "code.cmd"
 #args = ["{file}"]
 
+# 例3: 拡張子のないファイルを既定アプリで開く
+#[[openers]]
+#filenames = ["Makefile", "Dockerfile"]
+#mode = "default"
+
 # scrollback_lines = ペインごとのスクロールバック行数。既定 2000。
-# 0 で履歴なし。上限 100000(超過分は切り詰め)。反映は再起動時。
+# 0 で履歴なし。上限 100000(超過分は切り詰め)。r キーでは反映されず再起動が必要。
 # メモリ目安: 行数 × 画面桁数 × 32byte がペインごとの上限
 #scrollback_lines = 2000
 "##;
@@ -206,9 +309,26 @@ mod tests {
     fn opener(exts: &[&str], args: &[&str]) -> Opener {
         Opener {
             extensions: exts.iter().map(|s| s.to_string()).collect(),
-            command: "dummy".to_string(),
+            filenames: Vec::new(),
+            command: Some("dummy".to_string()),
+            mode: OpenerMode::Command,
             args: args.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// 名前付きコマンドの opener(どれが選ばれたかをテストで見分けるため)。
+    fn named(cmd: &str, exts: &[&str], names: &[&str]) -> Opener {
+        Opener {
+            extensions: exts.iter().map(|s| s.to_string()).collect(),
+            filenames: names.iter().map(|s| s.to_string()).collect(),
+            command: Some(cmd.to_string()),
+            mode: OpenerMode::Command,
+            args: Vec::new(),
+        }
+    }
+
+    fn cmd_of(cfg: &Config, path: &str) -> Option<String> {
+        cfg.find_opener(Path::new(path)).map(|o| o.command.clone().unwrap_or_default())
     }
 
     #[test]
@@ -223,7 +343,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.openers.len(), 1);
-        assert_eq!(cfg.openers[0].command, "typora");
+        assert_eq!(cfg.openers[0].command.as_deref(), Some("typora"));
         assert_eq!(cfg.openers[0].extensions, vec!["md", "markdown"]);
     }
 
@@ -348,6 +468,131 @@ mod tests {
         assert!(ensure_skel_at(&path).is_some());
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── v2: 末尾一致・filenames・mode ───────────────────
+
+    #[test]
+    fn test_find_opener_longest_extension_wins() {
+        // 記述順は gz が先。それでも長い一致(tar.gz)が勝つ
+        let cfg = Config {
+            openers: vec![named("gzip-app", &["gz"], &[]), named("tar-app", &["tar.gz"], &[])],
+            ..Default::default()
+        };
+        assert_eq!(cmd_of(&cfg, "backup.tar.gz").as_deref(), Some("tar-app"));
+        // 単独の .gz は短い方にしかマッチしない
+        assert_eq!(cmd_of(&cfg, "note.gz").as_deref(), Some("gzip-app"));
+    }
+
+    #[test]
+    fn test_find_opener_requires_dot_boundary() {
+        // "atar.gz" は ".tar.gz" で終わらないので tar.gz にはマッチしない
+        let cfg = Config { openers: vec![named("tar-app", &["tar.gz"], &[])], ..Default::default() };
+        assert!(cfg.find_opener(Path::new("atar.gz")).is_none());
+        assert!(cfg.find_opener(Path::new("a.tar.gz")).is_some());
+    }
+
+    #[test]
+    fn test_find_opener_filenames_beats_extensions() {
+        // Makefile.md のような名前でも、完全一致する filenames が無ければ拡張子側
+        let cfg = Config {
+            openers: vec![named("ext-app", &["mk"], &[]), named("name-app", &[], &["Makefile.mk"])],
+            ..Default::default()
+        };
+        assert_eq!(cmd_of(&cfg, "Makefile.mk").as_deref(), Some("name-app"));
+        assert_eq!(cmd_of(&cfg, "other.mk").as_deref(), Some("ext-app"));
+    }
+
+    #[test]
+    fn test_find_opener_matches_extensionless_filenames() {
+        let cfg = Config {
+            openers: vec![named("build-app", &[], &["Makefile", "Dockerfile"])],
+            ..Default::default()
+        };
+        assert!(cfg.find_opener(Path::new("Makefile")).is_some());
+        assert!(cfg.find_opener(Path::new("Dockerfile")).is_some());
+        // 大文字小文字は区別しない
+        assert!(cfg.find_opener(Path::new("MAKEFILE")).is_some());
+        assert!(cfg.find_opener(Path::new("Makefile.old")).is_none());
+    }
+
+    /// v1 からの意図的な挙動変更: ドットファイルが extensions にマッチする。
+    /// v1 は Path::extension() が None を返すため非マッチだった。
+    #[test]
+    fn test_find_opener_matches_dotfile_by_extension() {
+        let cfg = Config { openers: vec![opener(&["gitignore"], &[])], ..Default::default() };
+        assert!(cfg.find_opener(Path::new(".gitignore")).is_some());
+    }
+
+    #[test]
+    fn test_parse_mode_default_and_omitted() {
+        let cfg = Config::parse(
+            r#"
+            [[openers]]
+            extensions = ["md"]
+            mode = "default"
+
+            [[openers]]
+            extensions = ["rs"]
+            command = "editor"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.openers[0].mode, OpenerMode::Default);
+        assert!(cfg.openers[0].command.is_none());
+        // mode 省略時は従来どおり command 方式
+        assert_eq!(cfg.openers[1].mode, OpenerMode::Command);
+    }
+
+    #[test]
+    fn test_find_opener_skips_command_less_command_mode() {
+        // mode 省略 + command なしは起動しようがないので無視し、
+        // 後続の正しいオープナーが選ばれる
+        let cfg = Config::parse(
+            r#"
+            [[openers]]
+            extensions = ["md"]
+
+            [[openers]]
+            extensions = ["md"]
+            command = "fallback"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cmd_of(&cfg, "a.md").as_deref(), Some("fallback"));
+        assert!(cfg.unusable_opener_warning().is_some());
+    }
+
+    /// リロードは openers だけを差し替える。scrollback_lines まで
+    /// 差し替えると、以降に作られたペインだけ履歴長が変わってしまい
+    /// 「反映は再起動時」という案内と食い違う。
+    #[test]
+    fn test_apply_reload_replaces_openers_but_keeps_scrollback() {
+        // 元の openers を 1 件持たせることで「置換」と「追記」を区別する
+        let mut cfg = Config {
+            openers: vec![named("old-app", &["md"], &[])],
+            scrollback_lines: 5000,
+        };
+        let new = Config::parse(
+            r#"
+            scrollback_lines = 50000
+            [[openers]]
+            extensions = ["md"]
+            command = "new-app"
+            "#,
+        )
+        .unwrap();
+        cfg.apply_reload(new);
+        assert_eq!(cfg.openers.len(), 1);
+        assert_eq!(cmd_of(&cfg, "a.md").as_deref(), Some("new-app"));
+        assert_eq!(cfg.scrollback_lines, 5000);
+    }
+
+    #[test]
+    fn test_unusable_opener_warning_none_when_all_valid() {
+        let cfg = Config::parse("[[openers]]\nextensions = [\"md\"]\nmode = \"default\"").unwrap();
+        assert!(cfg.unusable_opener_warning().is_none());
+        assert!(cfg.find_opener(Path::new("a.md")).is_some());
     }
 
     #[test]

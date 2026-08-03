@@ -578,16 +578,19 @@ impl App {
     /// TUI プレビューにフォールバックする(失敗はステータスバー表示)。
     fn open_selected_file(&mut self, path: PathBuf) {
         if let Some(opener) = self.config.find_opener(&path).cloned() {
+            let label = match opener.mode {
+                crate::config::OpenerMode::Default => "既定アプリ".to_string(),
+                crate::config::OpenerMode::Command => opener.command.clone().unwrap_or_default(),
+            };
             match spawn_external_opener(&opener, &path) {
                 Ok(()) => {
-                    self.status_message =
-                        Some(format!("外部アプリで開きました: {}", opener.command));
+                    self.status_message = Some(format!("外部アプリで開きました: {}", label));
                     return;
                 }
                 Err(e) => {
                     self.status_message = Some(format!(
                         "外部起動失敗 ({}): {} — プレビューで開きます",
-                        opener.command, e
+                        label, e
                     ));
                 }
             }
@@ -597,6 +600,58 @@ impl App {
         let mut picker = self.image_picker.take();
         self.ws_mut().preview.load(&path, picker.as_mut(), Some(&boundary));
         self.image_picker = picker;
+    }
+
+    /// オープナー設定を一切参照せず、OS の既定アプリで開く(`o` キー)。
+    /// ディレクトリにも使えるので、エクスプローラ/Finder で開く手段を兼ねる。
+    /// プレビューへのフォールバックはしない — 既定アプリが無い拡張子でも
+    /// spawn 自体は成功し、その後の面倒は OS 側が見るため。
+    fn open_with_os_default(&mut self, path: &std::path::Path) {
+        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let label = abs
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| abs.to_string_lossy().to_string());
+        let args = vec![abs.to_string_lossy().to_string()];
+        self.status_message = Some(match spawn_detached(OS_DEFAULT_LAUNCHER, &args) {
+            Ok(()) => format!("既定アプリで開きました: {}", label),
+            Err(e) => format!("外部起動失敗 ({}): {}", label, e),
+        });
+    }
+
+    /// config.toml を読み直す(`r` キー)。
+    ///
+    /// `Config::load()` は使わない。load はパース失敗時に既定値
+    /// (openers 空)を返すため、そのまま差し替えると保存途中の壊れた TOML で
+    /// ユーザーのオープナー設定が黙って消える。読めたときだけ差し替え、
+    /// 失敗時は現在の設定を据え置く。load が持つ雛形生成の副作用も避けたい。
+    fn reload_config(&mut self) {
+        let msg = match crate::config::config_path() {
+            None => "設定ファイルの場所を特定できませんでした".to_string(),
+            Some(path) => match std::fs::read_to_string(&path) {
+                Err(e) => format!("config.toml を読めません(設定は据え置き): {}", e),
+                Ok(text) => match crate::config::Config::parse(&text) {
+                    Err(e) => format!("config.toml 再読み込み失敗(設定は据え置き): {}", e),
+                    Ok(cfg) => {
+                        let warning = cfg.unusable_opener_warning();
+                        // 無視した分を除いた「実際に効く」件数を出す
+                        let count = cfg.openers.iter().filter(|o| o.is_usable()).count();
+                        // 構造体ごと差し替えない。scrollback_lines は新規ペイン
+                        // 生成時に読まれるため、据え置くのが「再起動時に反映」の実装。
+                        self.config.apply_reload(cfg);
+                        match warning {
+                            // 警告だけを出すと再読み込みの成否が伝わらないので併記する
+                            Some(w) => format!("config.toml 再読み込み: openers {} 件 / {}", count, w),
+                            None => format!(
+                                "config.toml 再読み込み: openers {} 件(scrollback_lines は再起動時に反映)",
+                                count
+                            ),
+                        }
+                    }
+                },
+            },
+        };
+        self.status_message = Some(msg);
     }
 
     /// Recompute pane rectangles and apply sizes to every PTY in the
@@ -940,6 +995,24 @@ impl App {
                 if let Some(path) = path {
                     self.open_selected_file(path);
                 }
+                Ok(true)
+            }
+            // 'o' / 'r' は修飾キーなしのときだけ。Alt+R(タブ名リネーム)は
+            // このハンドラに来る前に消費されるが、Ctrl+O / Ctrl+R は届くため。
+            KeyCode::Char('o')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                // ディレクトリでも呼べるよう toggle_or_select は通さない
+                let path = self.ws().file_tree.selected_entry().map(|e| e.path.clone());
+                if let Some(path) = path {
+                    self.open_with_os_default(&path);
+                }
+                Ok(true)
+            }
+            KeyCode::Char('r')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.reload_config();
                 Ok(true)
             }
             KeyCode::Char('.') => {
@@ -1907,13 +1980,36 @@ impl App {
     }
 }
 
-/// 設定されたオープナーで path を外部アプリ起動する。
+/// OS の既定アプリでファイル/ディレクトリを開くためのランチャ。
+/// いずれも「関連付けを引いて開く」= エクスプローラや Finder の
+/// ダブルクリックと同じ動作で、実行ファイルを渡せば実行される。
+#[cfg(windows)]
+pub const OS_DEFAULT_LAUNCHER: &str = "explorer.exe";
+#[cfg(target_os = "macos")]
+pub const OS_DEFAULT_LAUNCHER: &str = "open";
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const OS_DEFAULT_LAUNCHER: &str = "xdg-open";
+
+/// オープナーの mode から (起動するプログラム, 引数) を決める。
 ///
-/// TUI 巻き込み防止のため stdio はすべて null に落とし、Windows では
-/// CREATE_NO_WINDOW でコンソールウィンドウの生成も抑止する(.cmd シム
-/// 起動時の黒窓フラッシュ対策)。シェルは経由せず args を直接渡す
-/// (引数エスケープは std に委譲。Rust 1.77.2+ の .bat/.cmd 対策込み)。
-/// spawn 成功後は使い捨てスレッドで wait し、Unix でのゾンビ化を防ぐ。
+/// mode = "default" では OS ランチャへ絶対パス 1 個だけを渡す。
+/// ランチャに `--foo` のようなアプリ固有引数を渡しても意味がない
+/// (むしろ誤解釈される)ため、opener の command / args は使わない。
+fn launch_argv(opener: &crate::config::Opener, abs: &str) -> (String, Vec<String>) {
+    match opener.mode {
+        crate::config::OpenerMode::Default => {
+            (OS_DEFAULT_LAUNCHER.to_string(), vec![abs.to_string()])
+        }
+        crate::config::OpenerMode::Command => (
+            // find_opener は command なしの command モードを弾くので
+            // ここに None は来ない(来ても空文字で spawn が Err になるだけ)。
+            opener.command.clone().unwrap_or_default(),
+            crate::config::build_args(opener, abs),
+        ),
+    }
+}
+
+/// 設定されたオープナーで path を外部アプリ起動する。
 fn spawn_external_opener(
     opener: &crate::config::Opener,
     path: &std::path::Path,
@@ -1921,10 +2017,20 @@ fn spawn_external_opener(
     // canonicalize は Windows で \\?\ プレフィックスが付き外部アプリが
     // 解釈できないことがあるため、FS を触らない absolute で正規化する。
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-    let args = crate::config::build_args(opener, &abs.to_string_lossy());
+    let (program, args) = launch_argv(opener, &abs.to_string_lossy());
+    spawn_detached(&program, &args)
+}
 
-    let mut cmd = std::process::Command::new(&opener.command);
-    cmd.args(&args)
+/// TUI を巻き込まずに外部プロセスを起動する。
+///
+/// stdio はすべて null に落とし、Windows では CREATE_NO_WINDOW で
+/// コンソールウィンドウの生成も抑止する(.cmd シム起動時の黒窓フラッシュ
+/// 対策)。シェルは経由せず args を直接渡す(引数エスケープは std に委譲。
+/// Rust 1.77.2+ の .bat/.cmd 対策込み)。spawn 成功後は使い捨てスレッドで
+/// wait し、Unix でのゾンビ化を防ぐ。
+fn spawn_detached(program: &str, args: &[String]) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -2105,6 +2211,35 @@ mod tests {
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(data);
         parser
+    }
+
+    fn test_opener(mode: crate::config::OpenerMode, args: &[&str]) -> crate::config::Opener {
+        crate::config::Opener {
+            extensions: vec!["md".to_string()],
+            filenames: Vec::new(),
+            command: Some("my-editor".to_string()),
+            mode,
+            args: args.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_launch_argv_command_mode_uses_command_and_args() {
+        let o = test_opener(crate::config::OpenerMode::Command, &["--open", "{file}"]);
+        let (program, args) = launch_argv(&o, "C:/work/a.md");
+        assert_eq!(program, "my-editor");
+        assert_eq!(args, vec!["--open".to_string(), "C:/work/a.md".to_string()]);
+    }
+
+    /// mode = "default" では OS ランチャに絶対パス 1 個だけを渡す。
+    /// opener 側の command / args を渡すと `--open` のようなアプリ固有
+    /// 引数が explorer.exe に流れてしまうため、無視されること自体が仕様。
+    #[test]
+    fn test_launch_argv_default_mode_ignores_command_and_args() {
+        let o = test_opener(crate::config::OpenerMode::Default, &["--open", "{file}"]);
+        let (program, args) = launch_argv(&o, "C:/work/a.md");
+        assert_eq!(program, OS_DEFAULT_LAUNCHER);
+        assert_eq!(args, vec!["C:/work/a.md".to_string()]);
     }
 
     #[test]
