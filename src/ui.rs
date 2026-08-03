@@ -820,6 +820,64 @@ fn render_preview(app: &mut App, frame: &mut Frame, area: Rect) {
 
 // ─── Status bar (context-aware) ───────────────────────────
 
+/// ステータスバー左側のキーヒント(フォーカス別)。
+///
+/// 同じ行の右側にはモデル名・コンテキスト使用量・git ブランチが並ぶため、
+/// ここが伸びるほど右端のキー(^Q 終了 など)が先に切り詰められる。
+/// 幅の上限は `test_focus_hints_width_budget` で固定しているので、
+/// 項目を足すときはラベルを詰めて予算内に収めること。
+fn focus_hints(focus: FocusTarget) -> Line<'static> {
+    match focus {
+        FocusTarget::Preview => Line::from(vec![
+            Span::styled(" Scroll", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" スクロール ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^W", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 閉じる ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^P", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 配置替 ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 終了", Style::default().fg(TEXT_DIM)),
+        ]),
+        FocusTarget::FileTree => Line::from(vec![
+            Span::styled(" j/k", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 移動 ", Style::default().fg(TEXT_DIM)),
+            Span::styled("Enter", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 開く ", Style::default().fg(TEXT_DIM)),
+            Span::styled("o", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 外部 ", Style::default().fg(TEXT_DIM)),
+            Span::styled("r", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 再読 ", Style::default().fg(TEXT_DIM)),
+            // 右端の ^F / ^Q まで見えるよう「隠しファイル」から短縮
+            Span::styled(".", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 隠し ", Style::default().fg(TEXT_DIM)),
+            Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 戻る ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^F", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 閉じる ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 終了", Style::default().fg(TEXT_DIM)),
+        ]),
+        FocusTarget::Pane => Line::from(vec![
+            Span::styled(" ^D", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 縦分割 ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^E", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 横分割 ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^W", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 閉じる ", Style::default().fg(TEXT_DIM)),
+            Span::styled("A-T", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 新タブ ", Style::default().fg(TEXT_DIM)),
+            Span::styled("A-R", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" タブ名 ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^F", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" ツリー ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^P", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 配置替 ", Style::default().fg(TEXT_DIM)),
+            Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 終了", Style::default().fg(TEXT_DIM)),
+        ]),
+    }
+}
+
 fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     let focus = app.ws().focus_target;
 
@@ -834,66 +892,20 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
     } else if app.rename_input.is_some() {
         Line::from(vec![
             Span::styled(" Enter", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 決定  ", Style::default().fg(TEXT_DIM)),
+            Span::styled(" 決定 ", Style::default().fg(TEXT_DIM)),
             Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 取消  ", Style::default().fg(TEXT_DIM)),
+            Span::styled(" 取消 ", Style::default().fg(TEXT_DIM)),
             Span::styled("空Enter", Style::default().fg(ACCENT_BLUE)),
             Span::styled(" 元に戻す", Style::default().fg(TEXT_DIM)),
         ])
-    } else { match focus {
-        FocusTarget::Preview => Line::from(vec![
-            Span::styled(" Scroll", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" スクロール  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^W", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 閉じる  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^P", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 配置替  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 終了", Style::default().fg(TEXT_DIM)),
-        ]),
-        FocusTarget::FileTree => Line::from(vec![
-            Span::styled(" j/k", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 移動  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("Enter", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 開く  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("o", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 外部  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("r", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 再読込  ", Style::default().fg(TEXT_DIM)),
-            // 幅を空けるため「隠しファイル」から短縮(o/r を足した分)
-            Span::styled(".", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 隠し  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 戻る  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^F", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 閉じる  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 終了", Style::default().fg(TEXT_DIM)),
-        ]),
-        FocusTarget::Pane => Line::from(vec![
-            Span::styled(" ^D", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 縦分割  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^E", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 横分割  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^W", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 閉じる  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("A-T", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 新タブ  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("A-R", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" タブ名  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^F", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" ツリー  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^P", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 配置替  ", Style::default().fg(TEXT_DIM)),
-            Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 終了", Style::default().fg(TEXT_DIM)),
-        ]),
-    }};
+    } else {
+        focus_hints(focus)
+    };
 
-    let status = Paragraph::new(hints).style(Style::default().bg(HEADER_BG));
-    frame.render_widget(status, area);
-
-    // Right-side info: Claude state of focused pane
+    // Right-side info: Claude state of focused pane.
+    // ヒントより先に組み立てる — 先に幅を確定させてヒント側の描画領域を
+    // 削らないと、同じ行へ後から上書きする形になり、ヒント末尾(^F / ^Q)が
+    // 右側情報の下に隠れて読めなくなる。
     let focused_id = app.ws().focused_pane_id;
     let claude_state = app.claude_monitor.state(focused_id);
     let has_claude = app
@@ -959,18 +971,29 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
         ));
     }
 
-    if !right_spans.is_empty() {
-        let total_width: u16 = right_spans
+    // 右側が実際に占有する幅(描画しない場合は 0)。行が右側だけで埋まる
+    // 狭さでは従来どおり右側を落とし、ヒントに全幅を渡す。
+    let right_width: u16 = if right_spans.is_empty() {
+        0
+    } else {
+        let w: u16 = right_spans
             .iter()
             .map(|s| unicode_width::UnicodeWidthStr::width(s.content.as_ref()) as u16)
             .sum();
-        if area.width > total_width {
-            let right_rect =
-                Rect::new(area.x + area.width - total_width, area.y, total_width, 1);
-            let widget =
-                Paragraph::new(Line::from(right_spans)).style(Style::default().bg(HEADER_BG));
-            frame.render_widget(widget, right_rect);
-        }
+        if area.width > w { w } else { 0 }
+    };
+
+    // ヒントは右側の占有分を除いた領域へ描く。入り切らない場合は ratatui が
+    // 末尾を切り詰めるが、重ね描きと違って「隠れて読めない」状態にはならない。
+    let hint_area = Rect { width: area.width - right_width, ..area };
+    let status = Paragraph::new(hints).style(Style::default().bg(HEADER_BG));
+    frame.render_widget(status, hint_area);
+
+    if right_width > 0 {
+        let right_rect = Rect::new(area.x + area.width - right_width, area.y, right_width, 1);
+        let widget =
+            Paragraph::new(Line::from(right_spans)).style(Style::default().bg(HEADER_BG));
+        frame.render_widget(widget, right_rect);
     }
 }
 
@@ -1023,5 +1046,29 @@ fn vt100_color_to_ratatui(color: vt100::Color) -> Color {
         vt100::Color::Default => Color::Reset,
         vt100::Color::Idx(idx) => Color::Indexed(idx),
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ステータスバーの 1 行は、左のキーヒントと右の情報(モデル名 /
+    /// コンテキスト使用量 / git ブランチ)で分け合う。右側は実測で 55〜60 桁
+    /// まで伸びるため、ヒントが長いと右端のキーから順に切り詰められる。
+    /// 予算はここで固定する — 項目を足すときはラベルを詰めて収めること。
+    #[test]
+    fn test_focus_hints_width_budget() {
+        // 予算は現状の実測値そのもの。増やす前にラベルを詰めること
+        // (右側情報は Claude 実行中に 55 桁前後まで伸びるため、
+        //  ヒントを伸ばした分だけ右端のキーが先に消える)。
+        for (focus, budget) in [
+            (FocusTarget::Preview, 46u16),
+            (FocusTarget::FileTree, 68),
+            (FocusTarget::Pane, 80),
+        ] {
+            let w = focus_hints(focus).width() as u16;
+            assert!(w <= budget, "{:?} のヒントが {} 桁(予算 {} 桁)", focus, w, budget);
+        }
     }
 }
