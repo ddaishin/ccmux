@@ -254,6 +254,7 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 # - filenames は拡張子を持たないファイル用の完全一致("Makefile" 等)。
 #   extensions のどのマッチよりも優先されます
 # - 大文字小文字は区別しません
+# - 同じ長さの一致が複数あれば、先に書いた [[openers]] が優先されます
 #
 # 起動方式(mode):
 # - mode 省略 = command を直接起動。{file} は絶対パスに置換(省略時は末尾に付加)
@@ -261,19 +262,38 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 #   ストアアプリ(MSIX)はインストールパスにバージョン番号が入り、アプリ更新の
 #   たびに直接パス指定が壊れるため、パスを書かずにこちらを使ってください
 
-# 例1: Markdown を OS の既定アプリで開く(ストアアプリはこの方式が安全)
+# 例1: 種類ごとに OS の既定アプリへ委ねる(ストアアプリはこの方式が安全)
+# 1 ブロックに複数の拡張子を、ファイルには複数のブロックを書けます
 #[[openers]]
-#extensions = ["md", "markdown"]
+#extensions = ["md", "markdown", "txt"]
+#mode = "default"
+#
+#[[openers]]
+#extensions = ["png", "jpg", "jpeg", "gif", "webp", "svg"]
+#mode = "default"
+#
+#[[openers]]
+#extensions = ["pdf", "xlsx", "docx", "pptx"]
 #mode = "default"
 
-# 例2: Markdown を VS Code で開く
+# 例2: 種類ごとに別のアプリを指定する
 # (Windows の .cmd シム(VS Code 等)は "code.cmd" のように拡張子まで書く)
 #[[openers]]
-#extensions = ["md", "markdown"]
+#extensions = ["rs", "toml", "json", "yaml", "yml"]
 #command = "code.cmd"
 #args = ["{file}"]
+#
+# args を省略すると絶対パスが末尾に付きます(= args = ["{file}"] と同じ)
+#[[openers]]
+#extensions = ["log", "csv"]
+#command = "notepad.exe"
 
-# 例3: 拡張子のないファイルを既定アプリで開く
+# 例3: 複合拡張子。"gz" と "tar.gz" が両方あれば長い "tar.gz" が優先されます
+#[[openers]]
+#extensions = ["tar.gz", "tgz", "zip"]
+#mode = "default"
+
+# 例4: 拡張子のないファイル(filenames は extensions より優先)
 #[[openers]]
 #filenames = ["Makefile", "Dockerfile"]
 #mode = "default"
