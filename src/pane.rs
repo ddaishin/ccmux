@@ -38,6 +38,45 @@ pub struct Pane {
     scrollback_limit: usize,
 }
 
+/// Minimum size handed to the PTY / vt100 parser. vt100 implicitly assumes
+/// the screen is wide enough for whatever glyph it is about to draw; a
+/// 1-column pane fed a single wide (CJK) character underflows `size.cols -
+/// width` in its resize/wrap math, which in release builds wraps around to a
+/// huge column index instead of panicking loudly, and the subsequent
+/// out-of-bounds cell access panics for real (doy/vt100-rust#37). The max
+/// display width of any `unicode-width` grapheme is 2, so 2 columns is
+/// always enough. `rows - 1` underflows the same way at 0 rows, so the row
+/// floor is 1. The rendered pane can still be narrower/shorter than this —
+/// only the PTY/vt100 size is floored, which is far less costly than the
+/// process dying.
+const MIN_PTY_ROWS: u16 = 1;
+const MIN_PTY_COLS: u16 = 2;
+
+fn clamp_pty_size(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.max(MIN_PTY_ROWS), cols.max(MIN_PTY_COLS))
+}
+
+/// Computes the PTY size `Pane::resize` should actually apply, given the
+/// size last applied and the newly requested size. Returns `None` when the
+/// resize is a no-op: a zero dimension (unusable — the caller has no drawable
+/// area yet) or, after clamping, the same size that's already applied.
+/// Extracted as a pure function so the dedup-after-clamp invariant (clamped
+/// sizes must be compared, not raw ones — `render_panes` calls this every
+/// frame, so comparing raw values would never dedup once a pane is clamped
+/// and would resend `\x1b[2J` every frame) is unit-testable without a PTY.
+fn next_pty_size(last: (u16, u16), req: (u16, u16)) -> Option<(u16, u16)> {
+    let (req_rows, req_cols) = req;
+    if req_rows == 0 || req_cols == 0 {
+        return None;
+    }
+    let clamped = clamp_pty_size(req_rows, req_cols);
+    if clamped == last {
+        None
+    } else {
+        Some(clamped)
+    }
+}
+
 impl Pane {
     /// Create a new pane with a PTY shell.
     pub fn new(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>, scrollback: usize) -> Result<Self> {
@@ -45,6 +84,7 @@ impl Pane {
     }
 
     pub fn new_with_cwd(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>, cwd: Option<PathBuf>, scrollback: usize) -> Result<Self> {
+        let (rows, cols) = clamp_pty_size(rows, cols);
         let pty_system = native_pty_system();
 
         let pty_size = PtySize {
@@ -170,14 +210,10 @@ impl Pane {
     /// a SIGWINCH was sent to the child). No-op and returns `false`
     /// when the size hasn't changed.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<bool> {
-        if rows == 0 || cols == 0 {
+        let Some((rows, cols)) = next_pty_size((self.last_rows, self.last_cols), (rows, cols))
+        else {
             return Ok(false);
-        }
-
-        // Skip if size hasn't changed
-        if rows == self.last_rows && cols == self.last_cols {
-            return Ok(false);
-        }
+        };
 
         self.last_rows = rows;
         self.last_cols = cols;
@@ -562,6 +598,39 @@ fn detect_shell_unix() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_clamp_pty_size_floors_narrow_dimensions() {
+        assert_eq!(clamp_pty_size(10, 1), (10, 2));
+        assert_eq!(clamp_pty_size(10, 0), (10, 2));
+        assert_eq!(clamp_pty_size(0, 40), (1, 40));
+    }
+
+    #[test]
+    fn test_clamp_pty_size_is_identity_above_floor() {
+        assert_eq!(clamp_pty_size(10, 40), (10, 40));
+    }
+
+    #[test]
+    fn test_next_pty_size_rejects_zero_dimension() {
+        assert_eq!(next_pty_size((10, 40), (10, 0)), None);
+        assert_eq!(next_pty_size((10, 40), (0, 40)), None);
+    }
+
+    #[test]
+    fn test_next_pty_size_dedups_after_clamp() {
+        // First request for a 1-column pane clamps to 2 and is accepted.
+        assert_eq!(next_pty_size((10, 40), (10, 1)), Some((10, 2)));
+        // A second identical raw request must dedup against the *clamped*
+        // size already applied, not the raw one — otherwise every frame
+        // re-triggers PTY resize + `\x1b[2J` (SIGWINCH storm / flicker).
+        assert_eq!(next_pty_size((10, 2), (10, 1)), None);
+    }
+
+    #[test]
+    fn test_next_pty_size_accepts_genuine_change() {
+        assert_eq!(next_pty_size((10, 40), (12, 50)), Some((12, 50)));
+    }
 
     #[test]
     fn test_title_indicates_claude_legacy_formats() {
