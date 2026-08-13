@@ -41,13 +41,30 @@ fn main() -> Result<()> {
         }
     }
 
-    // Install panic hook to restore terminal state on crash
+    // Install panic hook to restore terminal state on crash and to append a
+    // diagnostic record (thread name + panic location) to a crash log, so a
+    // panic in a per-pane PTY reader thread — which under `panic = "abort"`
+    // (release profile) takes the whole process down — leaves a trace of
+    // which pane and code path was responsible. Resolved once here, before
+    // the hook is installed, so the hook itself has one less failure point.
+    let crash_log_path = config::config_path().map(|p| {
+        p.parent()
+            .map(|d| d.join("crash.log"))
+            .unwrap_or_else(|| p.clone())
+    });
     let default_hook = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), crossterm::event::DisableMouseCapture);
         let _ = execute!(io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+
+        // Record before delegating to the default hook, in case the default
+        // hook's own stderr write is what's slow/blocked.
+        if let Some(path) = &crash_log_path {
+            let _ = write_crash_record(path, info);
+        }
+
         default_hook(info);
     }));
 
@@ -99,6 +116,67 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+/// Crash log entries above this size are discarded (not appended to) before
+/// the new record is written, so a crash-looping process doesn't grow the
+/// file unboundedly in the user's config directory.
+const CRASH_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Appends one crash record — epoch time, ccmux version, the panicking
+/// thread's name, panic location, and message — to `path`. No backtrace: the
+/// release profile strips symbols (`Cargo.toml` `[profile.release] strip =
+/// "symbols"`) to keep the distributed binary small, so a captured backtrace
+/// would be addresses only; `info.location()` plus the thread name (see
+/// `pane.rs`'s `ccmux-pty-N` naming) already pinpoint the panicking pane and
+/// code path for this bug class. Assembled into a single `String` and
+/// written with one `write_all`, so a rare concurrent panic can't interleave
+/// partial records.
+fn write_crash_record(
+    path: &std::path::Path,
+    info: &panic::PanicHookInfo<'_>,
+) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+
+    if std::fs::metadata(path)
+        .map(|m| m.len() > CRASH_LOG_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+
+    let message = info
+        .payload()
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| info.payload().downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    let location = info
+        .location()
+        .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let thread_name = std::thread::current()
+        .name()
+        .unwrap_or("<unnamed>")
+        .to_string();
+
+    let record = format!(
+        "---\ntime_epoch={epoch}\nversion={}\nthread={thread_name}\nlocation={location}\nmessage={message}\n",
+        version_check::CURRENT_VERSION,
+    );
+
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(record.as_bytes())
 }
 
 /// Minimum interval between two draws (frame pacing, ~60fps cap).

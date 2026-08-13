@@ -144,17 +144,22 @@ impl Pane {
         let claude_active_clone = Arc::clone(&claude_active);
         let scrollback_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let scrollback_clone = Arc::clone(&scrollback_counter);
-        let reader_handle = thread::spawn(move || {
-            pty_reader_thread(
-                reader,
-                parser_clone,
-                title_clone,
-                claude_active_clone,
-                scrollback_clone,
-                id,
-                event_tx,
-            );
-        });
+        // Named so a reader-thread panic message identifies which pane died
+        // (`thread 'ccmux-pty-3' panicked ...` instead of `thread '<unnamed>'`).
+        let reader_handle = thread::Builder::new()
+            .name(format!("ccmux-pty-{}", id))
+            .spawn(move || {
+                pty_reader_thread(
+                    reader,
+                    parser_clone,
+                    title_clone,
+                    claude_active_clone,
+                    scrollback_clone,
+                    id,
+                    event_tx,
+                );
+            })
+            .context("Failed to spawn PTY reader thread")?;
 
         let mut pane = Self {
             id,
