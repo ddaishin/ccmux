@@ -1,0 +1,111 @@
+diff --git a/src/row.rs b/src/row.rs
+index 4ae8d868..9006b9a4 100644
+--- a/src/row.rs
++++ b/src/row.rs
+@@ -56,7 +56,11 @@ impl Row {
+         let wide = self.cells[usize::from(i)].is_wide();
+         self.clear_wide(i);
+         self.cells[usize::from(i)].clear(attrs);
+-        if i == self.cols() - if wide { 2 } else { 1 } {
++        // `wide` is captured pre-erase on purpose: a 2-wide char occupies the
++        // logical last column at cols() - 2. saturating_sub guards the
++        // degenerate case of an orphaned wide cell in a one-column row, where
++        // cols() - 2 would underflow.
++        if i == self.cols().saturating_sub(if wide { 2 } else { 1 }) {
+             self.wrapped = false;
+         }
+     }
+@@ -71,8 +75,19 @@ impl Row {
+     }
+ 
+     pub fn resize(&mut self, len: u16, cell: crate::Cell) {
++        let old_len = self.cells.len();
+         self.cells.resize(usize::from(len), cell);
+         self.wrapped = false;
++        // When shrinking, a wide char at the new last position may
++        // have lost its continuation cell — clear it to avoid
++        // dangling state. Matches what Row::truncate already does.
++        let new_len = usize::from(len);
++        if new_len > 0 && new_len < old_len {
++            let last_cell = &mut self.cells[new_len - 1];
++            if last_cell.is_wide() {
++                last_cell.clear(*last_cell.attrs());
++            }
++        }
+     }
+ 
+     pub fn wrap(&mut self, wrap: bool) {
+@@ -84,9 +99,20 @@ impl Row {
+     }
+ 
+     pub fn clear_wide(&mut self, col: u16) {
+-        let cell = &self.cells[usize::from(col)];
++        let col_idx = usize::from(col);
++        let cell = &self.cells[col_idx];
+         let other = if cell.is_wide() {
+-            &mut self.cells[usize::from(col + 1)]
++            let next = col_idx + 1;
++            if next >= self.cells.len() {
++                // Wide char at the last column with no continuation
++                // (e.g. a shrinking resize that split the pair).
++                // Clear the cell in place instead of indexing past
++                // the end.
++                let attrs = *self.cells[col_idx].attrs();
++                self.cells[col_idx].clear(attrs);
++                return;
++            }
++            &mut self.cells[next]
+         } else if cell.is_wide_continuation() {
+             &mut self.cells[usize::from(col - 1)]
+         } else {
+@@ -472,3 +498,29 @@ impl Row {
+         (prev_pos, prev_attrs)
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // An orphaned wide cell (wide flag set, no continuation) in a
++    // one-column row must not make Row::erase underflow when it derives the
++    // logical last column as cols() - 2. Covers the Copilot review note on
++    // the clear_wide OOB fix: clear_wide itself was hardened, but its caller
++    // erase computed cols() - 2 == 1 - 2 from the captured `wide` value.
++    #[test]
++    fn erase_wide_cell_in_one_column_row_does_not_underflow() {
++        let attrs = crate::attrs::Attrs::default();
++        let mut row = Row::new(1);
++        // A 2-wide char in the only column: a wide cell with no room for a
++        // continuation cell.
++        row.get_mut(0).unwrap().set('中', attrs);
++        assert!(row.get(0).unwrap().is_wide());
++
++        row.erase(0, attrs);
++
++        let cell = row.get(0).unwrap();
++        assert!(!cell.is_wide(), "erased cell must no longer be wide");
++        assert!(!cell.has_contents(), "erased cell must be empty");
++    }
++}
+diff --git a/tests/basic.rs b/tests/basic.rs
+index ecc36d94..eaa92861 100644
+--- a/tests/basic.rs
++++ b/tests/basic.rs
+@@ -122,3 +122,16 @@ fn cell_attrs() {
+ 
+     assert!(parser.screen().cell(0, 4).unwrap().italic());
+ }
++
++// Regression test for the panic where shrinking a screen truncates the
++// continuation cell of a wide character, then erasing the line tries
++// to clear past the end of the row. The repro is from
++// https://github.com/doy/vt100-rust/issues/28.
++#[test]
++fn resize_truncating_wide_char_then_erase_line_does_not_panic() {
++    let mut parser = vt100::Parser::new(2, 4, 0);
++    parser.process("你".as_bytes());
++    parser.screen_mut().set_size(2, 1);
++    parser.process(b"\x1b[K");
++    assert_eq!(parser.screen().size(), (2, 1));
++}

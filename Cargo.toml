@@ -27,3 +27,13 @@ codegen-units = 1
 strip = "symbols"
 panic = "abort"
 opt-level = "s"
+
+# upstream vt100 (doy/vt100-rust) has been unmaintained for 1+ years with a
+# known panic (Issue #28, PR #30 unmerged) that this project hits. Vendored
+# copy + local patch — see vendor/vt100/PATCHES.md for the full writeup and
+# reapply instructions.
+[workspace]
+members = ["vendor/vt100"]
+
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
