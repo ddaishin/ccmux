@@ -13,6 +13,26 @@ v1 は `command` に絶対パスを書く方式のため MSIX アプリはアプ
 成立しない(調査結果は design.md ADR-5)ため **OS の既定アプリへ委譲するモード**でバージョン依存を断つ。
 あわせて複合拡張子/拡張子なしのマッチ、ディレクトリの外部起動、設定の手動リロードを入れる。
 
+### v3 の追加背景(2026-08-15)
+
+`mode = "default"` は explorer.exe 等の**委譲型ランチャ**への spawn であり、その成功は
+「対象拡張子に既定アプリが実際にある」ことを一切保証しない(explorer.exe 自体は常に
+起動できる)。結果、既定アプリの無い拡張子で Enter/`o` を押すと「開きました」という
+誤った成功表示だけが出て、TUI プレビューへのフォールバックが発火しなかった。
+
+当初 `FindExecutableW`(`.exe` パスを取り出す API)での判定を検討したが、実マシンの
+レジストリで `.md`(MSIX 版 MarkMaid Viewer。v2 が解決した当の対象)を確認したところ
+`DelegateExecute` のみで `(Default)` に `.exe` パスを持たず、この API では失敗を返すと
+判明した。実装すれば「開かないのに成功」が「開けるのにプレビューに落ちる」新たな退行に
+変わるため、ProgID の有無を問う `AssocQueryStringW` に切り替えた(design.md ADR-8)。
+
+### v4 の追加背景(2026-08-15)
+
+`o` キーはディレクトリに対して常に OS 既定ランチャへ委譲する(v2 の設計判断)。だが
+headless 環境や `xdg-open` 未導入の Linux 環境では、この委譲自体を避けたいケースが
+ある。ディレクトリには v3 の関連付け判定(拡張子ベース)が適用できないため、判定では
+なく config.toml の明示設定で解く。
+
 ## 2. 利用者と保守者(条件③)
 
 - 利用者/保守者とも doi(ローカルパッチ運用)。upstream マージ後は全ユーザー/Shin-sibainu
@@ -67,11 +87,32 @@ v1 は `command` に絶対パスを書く方式のため MSIX アプリはアプ
 v2 で意図的に変わる既存挙動: `extensions = ["md"]` が `.md` という名のドットファイルにもマッチする
 (v1 は `Path::extension()` が None で非マッチ)。改善として受け入れ、テストで固定する。
 
+### v3 で追加する受け入れ基準
+
+- WHEN Windows で `mode = "default"` のオープナーが発火し、その拡張子に既定アプリが
+  登録されていない THE SYSTEM SHALL spawn せず TUI プレビューを開き、既定アプリ未登録
+  である旨をステータスバーに表示する(Enter/クリック/`o` の全経路で同一)
+- WHEN 拡張子が無いファイル・ディレクトリ・判定 API が想定外の結果を返す
+  THE SYSTEM SHALL 従来どおり起動を試みる(fail-open)
+- WHEN macOS または Linux THE SYSTEM SHALL v2 と完全に同一の挙動を保つ(判定しない)
+
+### v4 で追加する受け入れ基準
+
+- WHEN `open_directory_with_os_default` が未設定または true でディレクトリに `o`
+  THE SYSTEM SHALL v2/v3 と完全に同一の挙動(OS 既定ランチャへ委譲)を保つ
+- WHEN false でディレクトリに `o` THE SYSTEM SHALL 外部プロセスを一切 spawn せず、
+  Enter と同じ展開/折りたたみを行い、無効である旨をステータスバーに表示する
+- WHEN false でファイルに `o` THE SYSTEM SHALL v3 と同一(関連付け判定 → 起動 or
+  プレビュー)。この設定はファイル経路に影響しない
+- WHEN `r` キーを押す THE SYSTEM SHALL `open_directory_with_os_default` の変更を
+  再起動なしで反映する
+
 ## 5. 制約(条件⑤)
 
 - 技術制約: Rust stable / ratatui + crossterm。rustfmt 非適用(cargo fmt 禁止)。
   依存は toml + serde(derive) のみで **v2 でも新規依存を追加しない**。
-  シェル文字列組み立て禁止(args ベクタ直接渡し)
+  シェル文字列組み立て禁止(args ベクタ直接渡し)。v4 も新規依存を追加しない
+  (`default_true()` を自前定義、`serde_aux` 等は使わない)
 - upstream 制約: 設定なし環境で挙動が完全不変であること(PR 前提)。法令/規程: 該当なし
 
 ## 6. スコープ外
@@ -82,7 +123,13 @@ v2 で意図的に変わる既存挙動: `extensions = ["md"]` が `.md` とい�
 - TUI 内での Markdown 装飾レンダリング・Mermaid 描画
 - AUMID 直接指定(COM の ActivateForFile が必要で windows crate 依存が増えるため不採用)
 - グロブパターンによるマッチ(末尾一致 + 完全一致で足りるため)
-- 子プロセスの成否追跡(spawn 成功=起動成功。既定アプリ未設定なら OS のダイアログが出るだけ)
+- 子プロセスの成否追跡は行わない(spawn 成功=起動成功として扱う)。ただし v3 で
+  **Windows の `mode = "default"` に限り**、spawn 前に既定アプリの有無を事前判定する
+  (機構は起動成否の追跡ではなく事前確認であり、上記の原則とは独立)
+- macOS/Linux での既定アプリ有無判定(duti 等の外部ツール依存、xdg-mime + 拡張子→MIME
+  変換が別途必要でコストに見合わないため v3 でも見送り。挙動は v2 のまま不変)
+- ファイル側 `o` の無効化(v4 の対象はディレクトリのみ)
+- `[general]` 等のサブテーブル化(v4 は既存 `Config` 構造体にトップレベルでフラット追加)
 
 ## 7. 未知の未知の決定事項(Phase 2 の承認結果)
 
@@ -98,3 +145,17 @@ v2 で意図的に変わる既存挙動: `extensions = ["md"]` が `.md` とい�
 - ディレクトリ → `o` キー(Enter は展開/折りたたみのまま。ツリー操作性を落とさない)
 - リロード → `r` キーの手動のみ(自動監視は保存途中の壊れた TOML を拾うため不採用)
 - `o` は OS のダブルクリック相当であり、`.exe` / `.bat` を選ぶと実行される点は許容する
+
+### v3 の承認結果(2026-08-15)
+
+- 判定手段 → `AssocQueryStringW`(shlwapi.dll、`extern "system"` 直接 FFI、新規 crate なし)
+- 対象範囲 → Windows のみ確実実装。macOS/Linux はスタブで現状維持(型レベルで保証)
+- 適用箇所 → `mode = "default"` のみ、Enter/クリック/`o` の全経路
+- 判定タイミング → spawn 直前で毎回(レジストリ参照のみで高速、キャッシュ不要)
+
+### v4 の承認結果(2026-08-15)
+
+- 既定値 → true(現状維持)。upstream 制約(設定なし環境で挙動不変)を優先
+- 配置 → `Config` 構造体にトップレベルでフラット追加。サブテーブルは新設しない
+- false 時の挙動 → 展開/折りたたみへフォールバック(Enter 相当)+ ステータス表示
+- `r` キー → 即時反映(`openers` と同じ扱い。`scrollback_lines` とは異なる)

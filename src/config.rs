@@ -97,6 +97,13 @@ fn default_scrollback_lines() -> usize {
     DEFAULT_SCROLLBACK_LINES
 }
 
+/// bool 設定の既定値 true 用ヘルパー。`#[serde(default)]` は bool を
+/// false にしてしまうため、既定 true の項目はこれを指定する
+/// (新規 crate 依存を増やさないための自前実装)。
+fn default_true() -> bool {
+    true
+}
+
 /// ccmux のユーザー設定。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -106,6 +113,13 @@ pub struct Config {
     /// vt100 Parser 生成時に固定されるため反映は起動時のみ。
     #[serde(default = "default_scrollback_lines")]
     pub scrollback_lines: usize,
+    /// ファイルツリーの `o` キーでディレクトリを OS 既定ランチャ
+    /// (explorer / open / xdg-open)へ渡すか。false にすると外部起動を
+    /// 一切試みず、Enter と同じ展開/折りたたみにフォールバックする
+    /// (xdg-open 未導入・headless 等の環境依存回避用)。
+    /// 既定 true = 従来挙動。`r` キーで即時反映。
+    #[serde(default = "default_true")]
+    pub open_directory_with_os_default: bool,
 }
 
 // derive(Default) だと scrollback_lines が 0 になり serde の
@@ -115,6 +129,7 @@ impl Default for Config {
         Self {
             openers: Vec::new(),
             scrollback_lines: default_scrollback_lines(),
+            open_directory_with_os_default: default_true(),
         }
     }
 }
@@ -194,6 +209,9 @@ impl Config {
     /// リロード対象を増やすときは必ずこのメソッドに追加すること。
     pub fn apply_reload(&mut self, new: Self) {
         self.openers = new.openers;
+        // `o` キー押下のたびに参照されるだけで、ペイン生成時に固定される
+        // 値ではないため即時差し替えできる(scrollback_lines との違い)。
+        self.open_directory_with_os_default = new.open_directory_with_os_default;
     }
 
     /// command 未指定で無視したオープナーがあれば警告文を返す。
@@ -245,8 +263,9 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 # 開きます。未登録・起動失敗時は従来どおり TUI プレビュー。
 #
 # ファイルツリーのキー:
-#   o = この設定に関係なく OS の既定アプリで開く(ディレクトリも可)
-#   r = このファイルを再読み込み([[openers]] のみ反映)
+#   o = この設定に関係なく OS の既定アプリで開く(ディレクトリも可。
+#       ディレクトリの挙動は下の open_directory_with_os_default で変えられます)
+#   r = このファイルを再読み込み([[openers]] と open_directory_with_os_default が反映)
 #
 # マッチの書き方:
 # - extensions はドットなし。ファイル名の末尾一致(ドット境界)なので
@@ -302,6 +321,14 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 # 0 で履歴なし。上限 100000(超過分は切り詰め)。r キーでは反映されず再起動が必要。
 # メモリ目安: 行数 × 画面桁数 × 32byte がペインごとの上限
 #scrollback_lines = 2000
+
+# open_directory_with_os_default = ファイルツリーで o を押したとき、
+# ディレクトリを OS の既定ランチャ(Windows: explorer.exe / macOS: open /
+# Linux: xdg-open)へ渡すか。既定 true(従来どおり)。
+# false にすると外部起動を一切試みず、Enter と同じ展開/折りたたみになります。
+# xdg-open が入っていない環境や headless 環境で、o の誤爆を防ぎたいときに。
+# r キーで再起動なしに反映されます。
+#open_directory_with_os_default = true
 "##;
 
 /// path に設定ファイルの雛形を生成する(初回起動時)。
@@ -423,6 +450,31 @@ mod tests {
         assert!(cfg.openers.is_empty());
         // 全コメントの雛形は既定値(=Default)と等価であること
         assert_eq!(cfg.scrollback_lines, Config::default().scrollback_lines);
+        assert_eq!(
+            cfg.open_directory_with_os_default,
+            Config::default().open_directory_with_os_default
+        );
+    }
+
+    // ─── v4: open_directory_with_os_default ─────────────────────
+
+    #[test]
+    fn test_open_directory_with_os_default_defaults_to_true() {
+        let cfg = Config::parse("").unwrap();
+        assert!(cfg.open_directory_with_os_default);
+    }
+
+    #[test]
+    fn test_open_directory_with_os_default_explicit_false() {
+        let cfg = Config::parse("open_directory_with_os_default = false").unwrap();
+        assert!(!cfg.open_directory_with_os_default);
+    }
+
+    #[test]
+    fn test_open_directory_with_os_default_non_bool_is_parse_err() {
+        let err = Config::parse("open_directory_with_os_default = \"no\"").unwrap_err();
+        assert!(!err.is_empty());
+        assert!(!err.contains('\n'));
     }
 
     #[test]
@@ -583,19 +635,21 @@ mod tests {
         assert!(cfg.unusable_opener_warning().is_some());
     }
 
-    /// リロードは openers だけを差し替える。scrollback_lines まで
-    /// 差し替えると、以降に作られたペインだけ履歴長が変わってしまい
-    /// 「反映は再起動時」という案内と食い違う。
+    /// リロードは openers と open_directory_with_os_default だけを差し替える。
+    /// scrollback_lines まで差し替えると、以降に作られたペインだけ履歴長が
+    /// 変わってしまい「反映は再起動時」という案内と食い違う。
     #[test]
-    fn test_apply_reload_replaces_openers_but_keeps_scrollback() {
+    fn test_apply_reload_replaces_openers_and_dir_flag_but_keeps_scrollback() {
         // 元の openers を 1 件持たせることで「置換」と「追記」を区別する
         let mut cfg = Config {
             openers: vec![named("old-app", &["md"], &[])],
             scrollback_lines: 5000,
+            open_directory_with_os_default: true,
         };
         let new = Config::parse(
             r#"
             scrollback_lines = 50000
+            open_directory_with_os_default = false
             [[openers]]
             extensions = ["md"]
             command = "new-app"
@@ -606,6 +660,7 @@ mod tests {
         assert_eq!(cfg.openers.len(), 1);
         assert_eq!(cmd_of(&cfg, "a.md").as_deref(), Some("new-app"));
         assert_eq!(cfg.scrollback_lines, 5000);
+        assert!(!cfg.open_directory_with_os_default);
     }
 
     #[test]

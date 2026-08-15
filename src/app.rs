@@ -582,6 +582,20 @@ impl App {
                 crate::config::OpenerMode::Default => "既定アプリ".to_string(),
                 crate::config::OpenerMode::Command => opener.command.clone().unwrap_or_default(),
             };
+            // mode = "default" は explorer.exe 等の委譲型ランチャへの spawn
+            // であり、その成功は「対象拡張子に既定アプリが実際にある」ことを
+            // 全く保証しない(explorer.exe 自体は常に起動できるため)。
+            // spawn する前に既定アプリの有無を確認し、無ければ spawn 自体を
+            // 呼ばずプレビューへ落とす。mode = "command" はユーザーが
+            // コマンドを明示しているので判定しない(should_try_external)。
+            if !should_try_external(opener.mode, || has_default_handler(&path)) {
+                self.status_message = Some(format!(
+                    "既定アプリ未登録{} — プレビューで開きます",
+                    ext_suffix(&path)
+                ));
+                self.fallback_to_preview(&path);
+                return;
+            }
             match spawn_external_opener(&opener, &path) {
                 Ok(()) => {
                     self.status_message = Some(format!("外部アプリで開きました: {}", label));
@@ -595,28 +609,81 @@ impl App {
                 }
             }
         }
+        self.fallback_to_preview(&path);
+    }
+
+    /// TUI プレビューを開く(外部起動しない/できないときの共通の受け皿)。
+    /// `open_selected_file` と `open_selected_with_os_default` の両方から呼ぶ。
+    /// ここをコピペすると `preview.load` の boundary 引数
+    /// (ワークスペース外拒否)が漏れる事故になるため、必ず経由すること。
+    fn fallback_to_preview(&mut self, path: &std::path::Path) {
         self.clear_selection_if_preview();
         let boundary = self.ws().initial_cwd.clone();
         let mut picker = self.image_picker.take();
-        self.ws_mut().preview.load(&path, picker.as_mut(), Some(&boundary));
+        self.ws_mut().preview.load(path, picker.as_mut(), Some(&boundary));
         self.image_picker = picker;
     }
 
-    /// オープナー設定を一切参照せず、OS の既定アプリで開く(`o` キー)。
-    /// ディレクトリにも使えるので、エクスプローラ/Finder で開く手段を兼ねる。
-    /// プレビューへのフォールバックはしない — 既定アプリが無い拡張子でも
-    /// spawn 自体は成功し、その後の面倒は OS 側が見るため。
-    fn open_with_os_default(&mut self, path: &std::path::Path) {
-        let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    /// オープナー設定を一切参照せず、ツリーで選択中のエントリを OS の
+    /// 既定アプリで開く(`o` キー)。ディレクトリにも使えるので、
+    /// エクスプローラ/Finder で開く手段を兼ねる。
+    /// v3: ファイルは起動前に既定アプリの有無を確認し、無ければ spawn せず
+    /// プレビューへ落とす(explorer.exe の spawn 成功は「開けた」を意味
+    /// しない)。
+    /// v4: ディレクトリは関連付け判定をせず、config.toml の
+    /// open_directory_with_os_default(既定 true)だけで決める。false のときは
+    /// 外部ランチャを一切呼ばず、Enter 相当の展開/折りたたみへフォールバック
+    /// する(xdg-open 未導入・headless 環境の回避策)。
+    /// パスを引数で受けず選択インデックス経由で読むのは、フォールバックの
+    /// トグルも選択インデックス経由(`toggle_or_select`)で行うため —
+    /// `FileTree` の根は非 canonicalize な cwd(`Workspace::new` の
+    /// `file_tree: FileTree::new(cwd.clone())`)で構築される一方、ここで使う
+    /// 絶対パスは `std::path::absolute()` 正規化なので、パス文字列で
+    /// ツリー内部を探すと環境によって一致しないおそれがある。
+    fn open_selected_with_os_default(&mut self) {
+        let Some(entry) = self.ws().file_tree.selected_entry() else {
+            return;
+        };
+        let path = entry.path.clone();
+        // fs を再 stat せずツリーのキャッシュ値を使う。ToggleDir を選ぶと
+        // toggle_or_select() 内部も同じキャッシュ値(FlatEntry::is_dir)で
+        // ディレクトリ/ファイルを判定するため、両者が食い違うと
+        // 戻り値の Some(path) を捨てて無反応になる(選択後に外部プロセスが
+        // 同名パスをファイル/ディレクトリに入れ替えるレースでのみ起き得る)。
+        // 同じ値を使うことでこの食い違いを構造的に排除する。
+        let is_dir = entry.is_dir;
+        let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
         let label = abs
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| abs.to_string_lossy().to_string());
-        let args = vec![abs.to_string_lossy().to_string()];
-        self.status_message = Some(match spawn_detached(OS_DEFAULT_LAUNCHER, &args) {
-            Ok(()) => format!("既定アプリで開きました: {}", label),
-            Err(e) => format!("外部起動失敗 ({}): {}", label, e),
-        });
+        match os_default_action(
+            is_dir,
+            self.config.open_directory_with_os_default,
+            || has_default_handler(&abs),
+        ) {
+            OsDefaultAction::ToggleDir => {
+                // is_dir を toggle_or_select() と同じキャッシュ値から
+                // 取っているので、戻り値は必ず None(展開/折りたたみのみ)。
+                let _ = self.ws_mut().file_tree.toggle_or_select();
+                self.status_message =
+                    Some("ディレクトリの外部起動は無効(設定)— 展開/折りたたみ".to_string());
+            }
+            OsDefaultAction::Preview => {
+                self.status_message = Some(format!(
+                    "既定アプリ未登録{} — プレビューで開きます",
+                    ext_suffix(&abs)
+                ));
+                self.fallback_to_preview(&abs);
+            }
+            OsDefaultAction::Launch => {
+                let args = vec![abs.to_string_lossy().to_string()];
+                self.status_message = Some(match spawn_detached(OS_DEFAULT_LAUNCHER, &args) {
+                    Ok(()) => format!("既定アプリで開きました: {}", label),
+                    Err(e) => format!("外部起動失敗 ({}): {}", label, e),
+                });
+            }
+        }
     }
 
     /// config.toml を読み直す(`r` キー)。
@@ -1002,11 +1069,7 @@ impl App {
             KeyCode::Char('o')
                 if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
-                // ディレクトリでも呼べるよう toggle_or_select は通さない
-                let path = self.ws().file_tree.selected_entry().map(|e| e.path.clone());
-                if let Some(path) = path {
-                    self.open_with_os_default(&path);
-                }
+                self.open_selected_with_os_default();
                 Ok(true)
             }
             KeyCode::Char('r')
@@ -1990,6 +2053,164 @@ pub const OS_DEFAULT_LAUNCHER: &str = "open";
 #[cfg(all(unix, not(target_os = "macos")))]
 pub const OS_DEFAULT_LAUNCHER: &str = "xdg-open";
 
+/// パスの拡張子を " (.ext)" の形で返す。無ければ空文字列。
+/// ステータスバー表示("既定アプリ未登録 (.md) — ...")専用の整形。
+fn ext_suffix(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(" (.{})", e))
+        .unwrap_or_default()
+}
+
+/// 外部起動を試みてよいか。
+///
+/// mode = "command" はユーザーがコマンドを明示指定しているので常に試す
+/// (実行ファイルの存在チェックは対象外 — 別問題として扱う)。
+/// mode = "default" は既定アプリが「無い」と分かったときだけ false にし、
+/// spawn せずプレビューへ回す。
+///
+/// handler_present は遅延評価(FnOnce)。Command モードではレジストリを
+/// 一切引かない — Windows 専用の `has_default_handler` を条件式の外に
+/// 追い出すことで、この判断ロジック自体は全プラットフォームでテストできる。
+fn should_try_external(
+    mode: crate::config::OpenerMode,
+    handler_present: impl FnOnce() -> bool,
+) -> bool {
+    match mode {
+        crate::config::OpenerMode::Command => true,
+        crate::config::OpenerMode::Default => handler_present(),
+    }
+}
+
+/// `o` キーで選択中のエントリをどう扱うか。FS にも FFI にも直接触れない
+/// 純粋な分岐結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OsDefaultAction {
+    /// OS 既定ランチャへ渡す(従来挙動)。
+    Launch,
+    /// ディレクトリの展開/折りたたみへフォールバック
+    /// (config.toml の open_directory_with_os_default = false のとき)。
+    ToggleDir,
+    /// TUI プレビューへフォールバック(既定アプリ未登録のファイル)。
+    Preview,
+}
+
+/// ディレクトリは `dir_launch_enabled`(config.toml の
+/// open_directory_with_os_default)だけで決まり、関連付け判定は行わない
+/// (ディレクトリに関連付けの概念が無いため)。handler_present は遅延評価
+/// — ディレクトリ経路では呼ばれないことを型と評価順で保証し、Windows 専用の
+/// レジストリ参照をファイル経路にだけ限定する。
+fn os_default_action(
+    is_dir: bool,
+    dir_launch_enabled: bool,
+    handler_present: impl FnOnce() -> bool,
+) -> OsDefaultAction {
+    if is_dir {
+        if dir_launch_enabled {
+            OsDefaultAction::Launch
+        } else {
+            OsDefaultAction::ToggleDir
+        }
+    } else if handler_present() {
+        OsDefaultAction::Launch
+    } else {
+        OsDefaultAction::Preview
+    }
+}
+
+// AssocQueryStringW(shlwapi.dll)。関連付けの ProgID を問い合わせる。
+// shlwapi.dll は Windows に常設のため、新規 crate を追加せず
+// `extern "system"` で直接 FFI 宣言する
+// (docs/specs/external-opener/requirements.md の「新規依存を追加しない」
+// 制約を維持するため)。
+#[cfg(windows)]
+#[link(name = "shlwapi")]
+extern "system" {
+    fn AssocQueryStringW(
+        flags: u32,
+        str_: u32,
+        psz_assoc: *const u16,
+        psz_extra: *const u16,
+        psz_out: *mut u16,
+        pcch_out: *mut u32,
+    ) -> i32;
+}
+
+/// `AssocQueryStringW` に渡す定数(shlwapi.h)。値はこのマシンで実測確認済み
+/// (docs/specs/external-opener/tasks.md T0)。
+#[cfg(windows)]
+const ASSOCF_INIT_IGNOREUNKNOWN: u32 = 0x400;
+#[cfg(windows)]
+const ASSOCSTR_PROGID: u32 = 20;
+/// HRESULT_FROM_WIN32(ERROR_NO_ASSOCIATION) = 0x80070483 の i32 表現。
+/// 実測: 未関連付け拡張子(.ccmuxprobe1〜3, .zzznotreal)で一貫してこの値。
+/// .md(MSIX/DelegateExecute のみで .exe パスを持たない関連付け)は
+/// ASSOCSTR_PROGID では hr=0 で成功するため偽陰性にならない
+/// (ASSOCSTR_EXECUTABLE だと .md 自体が失敗するため不採用 — 詳細は
+/// design.md ADR-8)。
+#[cfg(windows)]
+const HRESULT_NO_ASSOCIATION: i32 = -2147023741;
+
+/// 対象パスの拡張子に OS の既定アプリが登録されているか。
+///
+/// fail-open: 判定できないケースはすべて true(=従来どおり起動を試みる)に
+/// 倒す。false を返すのは Windows が「関連付けなし」と明示したときだけ。
+/// FS には一切触れない(拡張子文字列だけをレジストリに問い合わせる。
+/// パスが実在するかは見ない)。判定は毎回行いキャッシュしない
+/// (レジストリ参照のみで数百µs〜1ms程度、実測: tasks.md T0)。
+#[cfg(windows)]
+fn has_default_handler(path: &std::path::Path) -> bool {
+    // 拡張子なし(Makefile 等の filenames マッチ)は判定不能。従来どおり
+    // 起動を試みる(v2 の挙動を変えない)。
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return true;
+    };
+
+    use std::os::windows::ffi::OsStrExt as _;
+    let assoc: Vec<u16> = std::ffi::OsStr::new(&format!(".{}", ext))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let verb: Vec<u16> = std::ffi::OsStr::new("open")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut buf = [0u16; 260]; // MAX_PATH。ProgID にも十分な長さ
+    let mut len = buf.len() as u32;
+
+    // unsafe は API 呼び出し 1 行に閉じる。バッファ・長さとも有効な
+    // ローカル変数を指しており、呼び出し規約は shlwapi.h の宣言どおり。
+    let hr = unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN,
+            ASSOCSTR_PROGID,
+            assoc.as_ptr(),
+            verb.as_ptr(),
+            buf.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    !assoc_hresult_means_absent(hr)
+}
+
+/// HRESULT → 「既定アプリなし」の判定。純粋関数でテスト可能。
+/// 明示的な no-association 以外(成功・バッファ不足・その他想定外の
+/// HRESULT すべて)は「あり」に倒す(fail-open)。
+#[cfg(windows)]
+fn assoc_hresult_means_absent(hr: i32) -> bool {
+    hr == HRESULT_NO_ASSOCIATION
+}
+
+/// 非 Windows では判定手段を持たない — macOS は duti 等の外部ツール、
+/// Linux は xdg-mime コマンド呼び出し + 拡張子→MIME 変換が別途必要で、
+/// 実装・検証コストに見合わないため v3 のスコープ外とした。常に「あり」を
+/// 返し、従来どおり即時起動する(v2 から挙動不変。型レベルでスコープを
+/// 保証する)。
+#[cfg(not(windows))]
+fn has_default_handler(_path: &std::path::Path) -> bool {
+    true
+}
+
 /// オープナーの mode から (起動するプログラム, 引数) を決める。
 ///
 /// mode = "default" では OS ランチャへ絶対パス 1 個だけを渡す。
@@ -2240,6 +2461,108 @@ mod tests {
         let (program, args) = launch_argv(&o, "C:/work/a.md");
         assert_eq!(program, OS_DEFAULT_LAUNCHER);
         assert_eq!(args, vec!["C:/work/a.md".to_string()]);
+    }
+
+    // --- should_try_external / has_default_handler(v3: フォールバック復活) ---
+
+    #[test]
+    fn test_should_try_external_command_mode_always_true() {
+        assert!(should_try_external(crate::config::OpenerMode::Command, || false));
+    }
+
+    #[test]
+    fn test_should_try_external_default_mode_follows_handler() {
+        assert!(should_try_external(crate::config::OpenerMode::Default, || true));
+        assert!(!should_try_external(crate::config::OpenerMode::Default, || false));
+    }
+
+    /// Command モードはユーザーがコマンドを明示指定しているので、既定アプリの
+    /// 有無を判定するクロージャ自体を呼んではいけない(Windows 専用の
+    /// レジストリ参照を Command 経路で無駄に引かない、という設計の保証)。
+    #[test]
+    fn test_should_try_external_command_mode_does_not_call_handler_present() {
+        let called = std::cell::Cell::new(false);
+        should_try_external(crate::config::OpenerMode::Command, || {
+            called.set(true);
+            false
+        });
+        assert!(!called.get(), "Command モードで handler_present が呼ばれてはいけない");
+    }
+
+    /// 拡張子なし(Makefile 等の filenames マッチ)は判定不能なので、
+    /// Windows 実装・非Windows スタブのどちらでも true に倒す。
+    #[test]
+    fn test_has_default_handler_no_extension_is_true() {
+        assert!(has_default_handler(std::path::Path::new("Makefile")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_assoc_hresult_means_absent_maps_known_values() {
+        // 実測値(docs/specs/external-opener/tasks.md T0): 成功は 0、
+        // 未関連付けは一貫して HRESULT_NO_ASSOCIATION。
+        assert!(!assoc_hresult_means_absent(0));
+        assert!(assoc_hresult_means_absent(HRESULT_NO_ASSOCIATION));
+        // fail-open: 想定外の HRESULT(例: E_INVALIDARG = 0x80070057)は
+        // 「あり」に倒す。
+        assert!(!assoc_hresult_means_absent(-2147024809));
+    }
+
+    /// 実環境プローブ: このマシンで FFI が実際に通り、未関連付け拡張子を
+    /// 正しく判定できることの確認。実行環境の関連付け設定に依存するため
+    /// 純粋なユニットテストではないが、AssocQueryStringW 呼び出しが
+    /// エンドツーエンドで機能していることを回帰的に確認する。
+    #[cfg(windows)]
+    #[test]
+    fn test_has_default_handler_probe_unassociated_extension_is_false() {
+        assert!(!has_default_handler(std::path::Path::new(
+            "x.ccmux-test-never-associated-ext"
+        )));
+    }
+
+    // --- os_default_action(v4: ディレクトリ o キーの設定化) ---
+
+    #[test]
+    fn test_os_default_action_dir_launch_enabled() {
+        assert_eq!(
+            os_default_action(true, true, || false),
+            OsDefaultAction::Launch
+        );
+    }
+
+    #[test]
+    fn test_os_default_action_dir_launch_disabled() {
+        assert_eq!(
+            os_default_action(true, false, || true),
+            OsDefaultAction::ToggleDir
+        );
+    }
+
+    /// ファイル経路は dir_launch_enabled の値に一切左右されない
+    /// (true/false 両方で確認し、フラグの取り違えを防ぐ)。
+    #[test]
+    fn test_os_default_action_file_follows_handler_regardless_of_dir_flag() {
+        assert_eq!(
+            os_default_action(false, false, || true),
+            OsDefaultAction::Launch
+        );
+        assert_eq!(
+            os_default_action(false, true, || false),
+            OsDefaultAction::Preview
+        );
+    }
+
+    /// ディレクトリ経路では has_default_handler 相当のクロージャを
+    /// 呼んではいけない(関連付けの概念が無いディレクトリでレジストリを
+    /// 無駄に引かない、という設計の保証)。
+    #[test]
+    fn test_os_default_action_dir_does_not_call_handler_present() {
+        let called = std::cell::Cell::new(false);
+        os_default_action(true, true, || {
+            called.set(true);
+            true
+        });
+        assert!(!called.get(), "ディレクトリ経路で handler_present が呼ばれてはいけない");
     }
 
     #[test]
