@@ -2343,7 +2343,10 @@ fn editor_action(
         return EditorAction::NoConfigPath;
     }
 
-    if let Some(command) = editor.command.as_deref() {
+    // 空文字列は「未設定」として扱う($VISUAL/$EDITOR と同じ理由 —
+    // 空のプログラム名での spawn は必ず失敗し、原因の分かりにくいエラーに
+    // しかならない)。
+    if let Some(command) = editor.command.as_deref().filter(|s| !s.is_empty()) {
         let program = command.to_string();
         return if editor.in_pane {
             EditorAction::Pane { program, args: editor.args.clone() }
@@ -2867,6 +2870,22 @@ mod tests {
         // 空文字列は未設定として扱う(EDITOR="" のようなツール由来の値)
         assert_eq!(
             editor_action(&cfg, Some(&path), Some(""), Some("")),
+            EditorAction::OsDefault
+        );
+    }
+
+    #[test]
+    fn test_editor_action_empty_command_falls_back_like_unset() {
+        // command = "" は未設定と同じ扱い(空プログラム名での spawn は
+        // 必ず失敗し、原因の分かりにくいエラーにしかならないため)。
+        let cfg = editor_cfg(Some(""), true);
+        let path = std::path::PathBuf::from("C:/dummy/config.toml");
+        assert_eq!(
+            editor_action(&cfg, Some(&path), None, Some("nano")),
+            EditorAction::Pane { program: "nano".to_string(), args: Vec::new() }
+        );
+        assert_eq!(
+            editor_action(&cfg, Some(&path), None, None),
             EditorAction::OsDefault
         );
     }
