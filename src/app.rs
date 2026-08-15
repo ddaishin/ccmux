@@ -1231,9 +1231,15 @@ impl App {
     const MIN_PANE_WIDTH: u16 = 20;
     const MIN_PANE_HEIGHT: u16 = 5;
 
-    fn split_focused_pane(&mut self, direction: SplitDirection) -> Result<()> {
+    /// Whether the focused pane can currently be split in `direction`.
+    /// Returns `Err(reason)` when it cannot (max panes reached, or the split
+    /// would go below the minimum pane size). `Ctrl+D`/`Ctrl+E` treat the
+    /// error as a silent no-op (existing behavior, unchanged); the editor
+    /// launch path (`e`) surfaces `reason` in the status bar instead, since
+    /// silence there would look like a dead key rather than "can't open".
+    fn can_split(&self, direction: SplitDirection) -> Result<(), String> {
         if self.ws().layout.pane_count() >= Self::MAX_PANES {
-            return Ok(());
+            return Err(format!("ペイン数の上限({})に達しています", Self::MAX_PANES));
         }
 
         if let Some(&(_, rect)) = self
@@ -1245,19 +1251,51 @@ impl App {
             match direction {
                 SplitDirection::Vertical => {
                     if rect.width / 2 < Self::MIN_PANE_WIDTH {
-                        return Ok(());
+                        return Err("ペイン幅が足りないため分割できません".to_string());
                     }
                 }
                 SplitDirection::Horizontal => {
                     if rect.height / 2 < Self::MIN_PANE_HEIGHT {
-                        return Ok(());
+                        return Err("ペイン高さが足りないため分割できません".to_string());
                     }
                 }
             }
         }
 
-        let new_id = self.next_pane_id;
+        Ok(())
+    }
+
+    /// Allocate the next pane ID (fetch-and-increment). Callers that build a
+    /// `Pane` themselves (e.g. the editor launch path via
+    /// `Pane::new_with_command`) need the ID before construction, unlike
+    /// `split_focused_pane` which allocates and constructs inline.
+    fn alloc_pane_id(&mut self) -> usize {
+        let id = self.next_pane_id;
         self.next_pane_id = self.next_pane_id.wrapping_add(1);
+        id
+    }
+
+    /// Insert an already-constructed pane as a split of the currently
+    /// focused pane, and move focus to it. Shared by `split_focused_pane`
+    /// and the editor launch path.
+    fn attach_split_pane(&mut self, pane: Pane, direction: SplitDirection) {
+        let new_id = pane.id;
+        let ws = self.ws_mut();
+        ws.panes.insert(new_id, pane);
+        ws.layout.split_pane(ws.focused_pane_id, new_id, direction);
+        // Focus moves to the freshly-created pane so the user can type
+        // in it immediately after splitting.
+        ws.focused_pane_id = new_id;
+
+        self.mark_layout_change();
+    }
+
+    fn split_focused_pane(&mut self, direction: SplitDirection) -> Result<()> {
+        if self.can_split(direction).is_err() {
+            return Ok(());
+        }
+
+        let new_id = self.alloc_pane_id();
 
         // Inherit CWD from the focused pane
         let parent_cwd = self.ws().panes.get(&self.ws().focused_pane_id)
@@ -1271,47 +1309,54 @@ impl App {
             parent_cwd,
             self.config.scrollback_lines,
         )?;
-        let ws = self.ws_mut();
-        ws.panes.insert(new_id, pane);
-        ws.layout.split_pane(ws.focused_pane_id, new_id, direction);
-        // Focus moves to the freshly-created pane so the user can type
-        // in it immediately after splitting.
-        ws.focused_pane_id = new_id;
-
-        self.mark_layout_change();
+        self.attach_split_pane(pane, direction);
         Ok(())
     }
 
     fn close_focused_pane(&mut self) {
         let focused = self.ws().focused_pane_id;
+        self.close_pane(focused);
+    }
+
+    /// Close a pane by ID, regardless of current focus. `close_focused_pane`
+    /// is a thin wrapper over this for the `Ctrl+W` path. Only reassigns
+    /// focus when the closed pane was the focused one — closing a
+    /// background pane (e.g. an editor pane whose PtyEof arrived while the
+    /// user has already moved focus elsewhere) must not steal focus.
+    fn close_pane(&mut self, pane_id: usize) {
         let ws = self.ws_mut();
         if ws.layout.pane_count() <= 1 {
             return;
         }
 
         let pane_ids = ws.layout.collect_pane_ids();
-        let current_idx = pane_ids.iter().position(|&id| id == focused);
+        let current_idx = pane_ids.iter().position(|&id| id == pane_id);
+        let was_focused = ws.focused_pane_id == pane_id;
 
-        ws.layout.remove_pane(focused);
+        ws.layout.remove_pane(pane_id);
 
-        if let Some(mut pane) = ws.panes.remove(&focused) {
+        if let Some(mut pane) = ws.panes.remove(&pane_id) {
             pane.kill();
         }
 
         // Clean up claude monitor state for this pane
-        self.claude_monitor.remove(focused);
+        self.claude_monitor.remove(pane_id);
         let ws = self.ws_mut();
 
-        let remaining_ids = ws.layout.collect_pane_ids();
-        if let Some(idx) = current_idx {
-            let new_idx = if idx >= remaining_ids.len() {
-                remaining_ids.len().saturating_sub(1)
-            } else {
-                idx
-            };
-            ws.focused_pane_id = remaining_ids[new_idx];
-        } else if let Some(&first) = remaining_ids.first() {
-            ws.focused_pane_id = first;
+        if was_focused {
+            let remaining_ids = ws.layout.collect_pane_ids();
+            if let Some(idx) = current_idx {
+                let new_idx = if idx >= remaining_ids.len() {
+                    remaining_ids.len().saturating_sub(1)
+                } else {
+                    idx
+                };
+                if !remaining_ids.is_empty() {
+                    ws.focused_pane_id = remaining_ids[new_idx];
+                }
+            } else if let Some(&first) = remaining_ids.first() {
+                ws.focused_pane_id = first;
+            }
         }
 
         self.mark_layout_change();

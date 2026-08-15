@@ -77,6 +77,15 @@ fn next_pty_size(last: (u16, u16), req: (u16, u16)) -> Option<(u16, u16)> {
     }
 }
 
+/// What to spawn inside a new pane's PTY. `Shell` gets the existing
+/// shell-detection + `--login` + OSC 7 hook treatment; `Program` (used by
+/// `new_with_command`, e.g. to launch a text editor) is spawned as-is with
+/// none of that shell-specific setup.
+enum PaneCommand<'a> {
+    Shell,
+    Program { program: &'a str, args: &'a [String] },
+}
+
 impl Pane {
     /// Create a new pane with a PTY shell.
     pub fn new(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>, scrollback: usize) -> Result<Self> {
@@ -84,6 +93,46 @@ impl Pane {
     }
 
     pub fn new_with_cwd(id: usize, rows: u16, cols: u16, event_tx: Sender<AppEvent>, cwd: Option<PathBuf>, scrollback: usize) -> Result<Self> {
+        Self::spawn_with(id, rows, cols, event_tx, cwd, scrollback, PaneCommand::Shell)
+    }
+
+    /// Create a new pane running an arbitrary command (e.g. a text editor)
+    /// instead of a shell. No shell-specific setup (`--login`, OSC 7 hook
+    /// injection — see `spawn_with`) is applied; the command is spawned as-is.
+    pub fn new_with_command(
+        id: usize,
+        rows: u16,
+        cols: u16,
+        event_tx: Sender<AppEvent>,
+        program: &str,
+        args: &[String],
+        cwd: Option<PathBuf>,
+        scrollback: usize,
+    ) -> Result<Self> {
+        Self::spawn_with(
+            id,
+            rows,
+            cols,
+            event_tx,
+            cwd,
+            scrollback,
+            PaneCommand::Program { program, args },
+        )
+    }
+
+    /// Shared PTY/vt100/reader-thread setup for both `new_with_cwd` (shell)
+    /// and `new_with_command` (arbitrary program, e.g. an editor). Only the
+    /// command-building and post-spawn shell setup (`--login`, OSC 7 hook)
+    /// differ between the two, gated on `command`.
+    fn spawn_with(
+        id: usize,
+        rows: u16,
+        cols: u16,
+        event_tx: Sender<AppEvent>,
+        cwd: Option<PathBuf>,
+        scrollback: usize,
+        command: PaneCommand,
+    ) -> Result<Self> {
         let (rows, cols) = clamp_pty_size(rows, cols);
         let pty_system = native_pty_system();
 
@@ -98,16 +147,28 @@ impl Pane {
             .openpty(pty_size)
             .context("Failed to open PTY")?;
 
-        let shell = detect_shell();
-        let mut cmd = CommandBuilder::new(&shell);
+        let program_path = match &command {
+            PaneCommand::Shell => detect_shell(),
+            PaneCommand::Program { program, .. } => PathBuf::from(program),
+        };
+        let mut cmd = CommandBuilder::new(&program_path);
 
-        let shell_name = shell
+        let shell_name = program_path
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
 
-        if shell_name.contains("bash") || shell_name.contains("zsh") {
-            cmd.arg("--login");
+        match &command {
+            PaneCommand::Shell => {
+                if shell_name.contains("bash") || shell_name.contains("zsh") {
+                    cmd.arg("--login");
+                }
+            }
+            PaneCommand::Program { args, .. } => {
+                for arg in args.iter() {
+                    cmd.arg(arg);
+                }
+            }
         }
 
         let work_dir = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -178,22 +239,27 @@ impl Pane {
             scrollback_limit: scrollback,
         };
 
-        // Inject OSC 7 hook after shell starts
-        // Leading space prevents it from appearing in bash history
-        if shell_name.contains("bash") {
-            let setup = concat!(
-                " __ccmux_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"; };",
-                " PROMPT_COMMAND=\"__ccmux_osc7;${PROMPT_COMMAND}\";",
-                " clear\n",
-            );
-            let _ = pane.write_input(setup.as_bytes());
-        } else if shell_name.contains("zsh") {
-            let setup = concat!(
-                " __ccmux_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOST\" \"$PWD\"; };",
-                " precmd_functions+=(__ccmux_osc7);",
-                " clear\n",
-            );
-            let _ = pane.write_input(setup.as_bytes());
+        // Inject OSC 7 hook after shell starts — shell-only. This writes shell
+        // syntax as PTY *input*; sending it to an arbitrary program (e.g. an
+        // editor spawned via `new_with_command`) would get typed into its
+        // buffer instead of being interpreted, corrupting the editor session.
+        // Leading space prevents it from appearing in bash history.
+        if matches!(command, PaneCommand::Shell) {
+            if shell_name.contains("bash") {
+                let setup = concat!(
+                    " __ccmux_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOSTNAME\" \"$PWD\"; };",
+                    " PROMPT_COMMAND=\"__ccmux_osc7;${PROMPT_COMMAND}\";",
+                    " clear\n",
+                );
+                let _ = pane.write_input(setup.as_bytes());
+            } else if shell_name.contains("zsh") {
+                let setup = concat!(
+                    " __ccmux_osc7() { printf '\\033]7;file://%s%s\\007' \"$HOST\" \"$PWD\"; };",
+                    " precmd_functions+=(__ccmux_osc7);",
+                    " clear\n",
+                );
+                let _ = pane.write_input(setup.as_bytes());
+            }
         }
 
         Ok(pane)

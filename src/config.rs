@@ -224,14 +224,12 @@ impl Config {
     }
 }
 
-/// オープナーの args を実引数へ展開する(mode = "command" 専用)。
-/// "{file}" を abs_path に置換し、どの引数にも現れない場合は末尾に付加する。
-/// mode = "default" では OS ランチャに追加引数を渡す意味がないため
-/// 呼び出し側で分岐し、この関数は通らない。
-pub fn build_args(opener: &Opener, abs_path: &str) -> Vec<String> {
+/// "{file}" を abs_path に置換した引数リストを組み立てる。どの引数にも
+/// "{file}" が現れない場合は末尾に付加する。`[[openers]]` の args と
+/// `[editor]` の args で同じ規約を共有するため、`build_args` から抽出した。
+pub fn expand_file_args(args: &[String], abs_path: &str) -> Vec<String> {
     let mut replaced = false;
-    let mut out: Vec<String> = opener
-        .args
+    let mut out: Vec<String> = args
         .iter()
         .map(|a| {
             if a.contains("{file}") {
@@ -246,6 +244,13 @@ pub fn build_args(opener: &Opener, abs_path: &str) -> Vec<String> {
         out.push(abs_path.to_string());
     }
     out
+}
+
+/// オープナーの args を実引数へ展開する(mode = "command" 専用)。
+/// mode = "default" では OS ランチャに追加引数を渡す意味がないため
+/// 呼び出し側で分岐し、この関数は通らない。
+pub fn build_args(opener: &Opener, abs_path: &str) -> Vec<String> {
+    expand_file_args(&opener.args, abs_path)
 }
 
 pub(crate) fn config_path() -> Option<PathBuf> {
@@ -331,11 +336,12 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 #open_directory_with_os_default = true
 "##;
 
-/// path に設定ファイルの雛形を生成する(初回起動時)。
+/// path に設定ファイルの雛形を生成する(初回起動時、および e キーで
+/// エディタを開く直前 — create_new のため既存ファイルがあれば no-op)。
 /// 不在判定は呼び出し側(read の NotFound)、作成は create_new で
 /// 原子的に行い、競合時も既存ファイルを上書きしない。
 /// あらゆる失敗は None(fail-open: 雛形は利便機能であり起動を止めない)。
-fn ensure_skel_at(path: &Path) -> Option<String> {
+pub(crate) fn ensure_skel_at(path: &Path) -> Option<String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok()?;
     }
