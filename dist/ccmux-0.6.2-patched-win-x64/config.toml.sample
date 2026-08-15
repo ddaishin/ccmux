@@ -7,8 +7,9 @@
 # 開きます。未登録・起動失敗時は従来どおり TUI プレビュー。
 #
 # ファイルツリーのキー:
-#   o = この設定に関係なく OS の既定アプリで開く(ディレクトリも可)
-#   r = このファイルを再読み込み([[openers]] のみ反映)
+#   o = この設定に関係なく OS の既定アプリで開く(ディレクトリも可。
+#       ディレクトリの挙動は下の open_directory_with_os_default で変えられます)
+#   r = このファイルを再読み込み([[openers]] と open_directory_with_os_default が反映)
 #
 # マッチの書き方:
 # - extensions はドットなし。ファイル名の末尾一致(ドット境界)なので
@@ -64,3 +65,11 @@
 # 0 で履歴なし。上限 100000(超過分は切り詰め)。r キーでは反映されず再起動が必要。
 # メモリ目安: 行数 × 画面桁数 × 32byte がペインごとの上限
 #scrollback_lines = 2000
+
+# open_directory_with_os_default = ファイルツリーで o を押したとき、
+# ディレクトリを OS の既定ランチャ(Windows: explorer.exe / macOS: open /
+# Linux: xdg-open)へ渡すか。既定 true(従来どおり)。
+# false にすると外部起動を一切試みず、Enter と同じ展開/折りたたみになります。
+# xdg-open が入っていない環境や headless 環境で、o の誤爆を防ぎたいときに。
+# r キーで再起動なしに反映されます。
+#open_directory_with_os_default = true
