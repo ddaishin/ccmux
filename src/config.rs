@@ -104,6 +104,39 @@ fn default_true() -> bool {
     true
 }
 
+/// config.toml を開くエディタの設定([editor])。ファイルツリーで `e` を
+/// 押すと config.toml をこの設定で開く。
+#[derive(Debug, Clone, Deserialize)]
+pub struct EditorConfig {
+    /// 起動コマンド。未指定なら `$VISUAL` -> `$EDITOR` -> OS 既定アプリの順で
+    /// フォールバックする。
+    #[serde(default)]
+    pub command: Option<String>,
+    /// 引数。"{file}" は config.toml の絶対パスに置換され、どの引数にも
+    /// 現れない場合は末尾に自動付加される([[openers]] と同じ規約、
+    /// `expand_file_args` を共有)。
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// true(既定) = ccmux のペイン内で PTY 起動(vim/nano 等の
+    /// ターミナルエディタ向け)。false = OS 既定アプリと同じ detached
+    /// 起動(GUI エディタ向け)。既定を true にしているのは、false のまま
+    /// ターミナルエディタを指定すると null stdio で無音のまま起動失敗し
+    /// 「開きました」という誤った成功表示だけが出るため
+    /// (external-opener v3 が解決した問題の再発を避ける)。
+    #[serde(default = "default_true")]
+    pub in_pane: bool,
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            in_pane: default_true(),
+        }
+    }
+}
+
 /// ccmux のユーザー設定。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -120,6 +153,9 @@ pub struct Config {
     /// 既定 true = 従来挙動。`r` キーで即時反映。
     #[serde(default = "default_true")]
     pub open_directory_with_os_default: bool,
+    /// config.toml を `e` キーで開くエディタの設定。
+    #[serde(default)]
+    pub editor: EditorConfig,
 }
 
 // derive(Default) だと scrollback_lines が 0 になり serde の
@@ -130,6 +166,7 @@ impl Default for Config {
             openers: Vec::new(),
             scrollback_lines: default_scrollback_lines(),
             open_directory_with_os_default: default_true(),
+            editor: EditorConfig::default(),
         }
     }
 }
@@ -212,6 +249,9 @@ impl Config {
         // `o` キー押下のたびに参照されるだけで、ペイン生成時に固定される
         // 値ではないため即時差し替えできる(scrollback_lines との違い)。
         self.open_directory_with_os_default = new.open_directory_with_os_default;
+        // editor も `e` キー押下のたびに参照されるだけで固定値ではないため
+        // 即時差し替え可能(open_directory_with_os_default と同じ扱い)。
+        self.editor = new.editor;
     }
 
     /// command 未指定で無視したオープナーがあれば警告文を返す。
@@ -271,6 +311,7 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 #   o = この設定に関係なく OS の既定アプリで開く(ディレクトリも可。
 #       ディレクトリの挙動は下の open_directory_with_os_default で変えられます)
 #   r = このファイルを再読み込み([[openers]] と open_directory_with_os_default が反映)
+#   e = このファイル(config.toml)自体をエディタで開く(下の [editor] 参照)
 #
 # マッチの書き方:
 # - extensions はドットなし。ファイル名の末尾一致(ドット境界)なので
@@ -334,6 +375,24 @@ pub(crate) const CONFIG_SKEL: &str = r##"# ccmux 設定ファイル
 # xdg-open が入っていない環境や headless 環境で、o の誤爆を防ぎたいときに。
 # r キーで再起動なしに反映されます。
 #open_directory_with_os_default = true
+
+# [editor] = ファイルツリーで e を押したとき、このファイル(config.toml)を
+# 開くエディタの設定です。command を省略すると $VISUAL -> $EDITOR -> OS の
+# 既定アプリの順にフォールバックします。
+#[editor]
+# command = vim / nano のようなターミナルエディタは in_pane = true(既定)の
+# ままで構いません。VS Code や メモ帳のような GUI エディタを使う場合は、
+# 下の in_pane を false にしてください(true のままだと、ペイン内で GUI
+# エディタのプロセスがすぐ制御を返してしまい、何も起きたように見えません)。
+#command = "vim"
+# args を省略すると絶対パスが末尾に付きます(= args = ["{file}"] と同じ)。
+#args = ["{file}"]
+# true(既定) = ccmux のペイン内で起動(ターミナルエディタ向け)。
+# false = 別ウィンドウで起動(GUI エディタ向け)。
+#in_pane = true
+# in_pane = true で開いたエディタを閉じると、config.toml は自動で
+# 再読み込みされます。in_pane = false(GUI エディタ)の場合は、閉じても
+# 自動では反映されないため r キーで手動リロードしてください。
 "##;
 
 /// path に設定ファイルの雛形を生成する(初回起動時、および e キーで
@@ -460,6 +519,8 @@ mod tests {
             cfg.open_directory_with_os_default,
             Config::default().open_directory_with_os_default
         );
+        assert_eq!(cfg.editor.command, Config::default().editor.command);
+        assert_eq!(cfg.editor.in_pane, Config::default().editor.in_pane);
     }
 
     // ─── v4: open_directory_with_os_default ─────────────────────
@@ -651,6 +712,7 @@ mod tests {
             openers: vec![named("old-app", &["md"], &[])],
             scrollback_lines: 5000,
             open_directory_with_os_default: true,
+            editor: EditorConfig::default(),
         };
         let new = Config::parse(
             r#"
@@ -659,6 +721,8 @@ mod tests {
             [[openers]]
             extensions = ["md"]
             command = "new-app"
+            [editor]
+            command = "vim"
             "#,
         )
         .unwrap();
@@ -667,6 +731,33 @@ mod tests {
         assert_eq!(cmd_of(&cfg, "a.md").as_deref(), Some("new-app"));
         assert_eq!(cfg.scrollback_lines, 5000);
         assert!(!cfg.open_directory_with_os_default);
+        assert_eq!(cfg.editor.command.as_deref(), Some("vim"));
+    }
+
+    // ─── config-editor: [editor] ─────────────────────────────
+
+    #[test]
+    fn test_editor_omitted_defaults_to_none_command_and_in_pane_true() {
+        let cfg = Config::parse("").unwrap();
+        assert_eq!(cfg.editor.command, None);
+        assert!(cfg.editor.args.is_empty());
+        assert!(cfg.editor.in_pane);
+    }
+
+    #[test]
+    fn test_editor_command_and_args_parse() {
+        let cfg = Config::parse(
+            r#"
+            [editor]
+            command = "vim"
+            args = ["{file}"]
+            in_pane = false
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.editor.command.as_deref(), Some("vim"));
+        assert_eq!(cfg.editor.args, vec!["{file}".to_string()]);
+        assert!(!cfg.editor.in_pane);
     }
 
     #[test]

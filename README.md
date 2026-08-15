@@ -87,6 +87,9 @@ Launch from any directory. The file tree shows the current working directory.
 |-----|--------|
 | `j` / `k` | Move selection |
 | `Enter` | Open file / expand directory |
+| `o` | Open with OS default app (works on directories too) |
+| `r` | Reload config.toml |
+| `e` | Open config.toml in an editor (see `[editor]` in config.toml) |
 | `.` | Toggle hidden files |
 | `Esc` | Return to pane |
 

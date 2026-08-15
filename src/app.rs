@@ -492,6 +492,13 @@ pub struct App {
     /// One-shot status bar message (external opener result, config
     /// warning). Cleared on the next key input.
     pub status_message: Option<String>,
+    /// IDs of panes running an in-pane editor (`e` key, `[editor] in_pane =
+    /// true`), pending an automatic close + config reload on `PtyEof`. A
+    /// `HashSet` rather than a single `Option<usize>` because the user can
+    /// open the editor from more than one tab. Pane IDs are global
+    /// (`next_pane_id` lives on `App`, not per workspace), so a single flat
+    /// set is enough — no need to track which workspace each ID belongs to.
+    editor_panes: std::collections::HashSet<usize>,
 }
 
 impl App {
@@ -546,6 +553,7 @@ impl App {
             image_picker: None,
             config,
             status_message: None,
+            editor_panes: std::collections::HashSet::new(),
         })
     }
 
@@ -686,14 +694,107 @@ impl App {
         }
     }
 
+    /// `e` キー: config.toml をエディタで開く。ファイルツリーで何が選択
+    /// されていても対象は常に config.toml 固定
+    /// (docs/specs/config-editor/design.md §5)。
+    fn open_config_in_editor(&mut self) {
+        let Some(path) = crate::config::config_path() else {
+            self.status_message = Some("設定ファイルの場所を特定できませんでした".to_string());
+            return;
+        };
+        // 起動直前にもう一度雛形生成を試みる(create_new なので既存ファイルが
+        // あれば no-op)。起動時の生成に失敗していた環境からの回復を兼ねる。
+        // 戻り値の雛形生成メッセージは表示しない — 起動処理そのものの結果を
+        // 優先する(雛形生成は静かな前処理として扱う)。
+        let _ = crate::config::ensure_skel_at(&path);
+
+        let visual = std::env::var("VISUAL").ok();
+        let editor_env = std::env::var("EDITOR").ok();
+        let action = editor_action(
+            &self.config.editor,
+            Some(path.as_path()),
+            visual.as_deref(),
+            editor_env.as_deref(),
+        );
+
+        match action {
+            EditorAction::NoConfigPath => {
+                self.status_message = Some("設定ファイルの場所を特定できませんでした".to_string());
+            }
+            EditorAction::Pane { program, args } => {
+                let args = crate::config::expand_file_args(&args, &path.to_string_lossy());
+                if let Err(reason) = self.can_split(SplitDirection::Horizontal) {
+                    self.status_message = Some(format!("エディタを開けません: {}", reason));
+                    return;
+                }
+                let new_id = self.alloc_pane_id();
+                let cwd = path.parent().map(|p| p.to_path_buf());
+                match Pane::new_with_command(
+                    new_id,
+                    10,
+                    40,
+                    self.event_tx.clone(),
+                    &program,
+                    &args,
+                    cwd,
+                    self.config.scrollback_lines,
+                ) {
+                    Ok(pane) => {
+                        self.attach_split_pane(pane, SplitDirection::Horizontal);
+                        // e はファイルツリーフォーカス中に押されるため、
+                        // 分割で移った新ペインにキー入力が届くよう明示する
+                        // (split_focused_pane は既にペインフォーカス中に
+                        // 呼ばれるため、この明示が要らない他の呼び出し元と違う)。
+                        self.ws_mut().focus_target = FocusTarget::Pane;
+                        self.editor_panes.insert(new_id);
+                        self.status_message = Some(format!("エディタを起動しました: {}", program));
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("エディタの起動に失敗しました: {}", e));
+                    }
+                }
+            }
+            EditorAction::Detached { program, args } => {
+                let args = crate::config::expand_file_args(&args, &path.to_string_lossy());
+                self.status_message = Some(match spawn_detached(&program, &args) {
+                    Ok(()) => format!(
+                        "エディタを起動しました: {}(終了後は r キーで反映してください)",
+                        program
+                    ),
+                    Err(e) => format!("エディタの起動に失敗しました: {}", e),
+                });
+            }
+            EditorAction::OsDefault => {
+                if has_default_handler(&path) {
+                    let args = vec![path.to_string_lossy().to_string()];
+                    self.status_message = Some(match spawn_detached(OS_DEFAULT_LAUNCHER, &args) {
+                        Ok(()) => {
+                            "既定アプリで開きました(終了後は r キーで反映してください)".to_string()
+                        }
+                        Err(e) => format!("外部起動失敗: {}", e),
+                    });
+                } else {
+                    self.status_message = Some(format!(
+                        "既定アプリ未登録{} — config.toml の [editor] でエディタを設定してください",
+                        ext_suffix(&path)
+                    ));
+                }
+            }
+        }
+    }
+
     /// config.toml を読み直す(`r` キー)。
     ///
     /// `Config::load()` は使わない。load はパース失敗時に既定値
     /// (openers 空)を返すため、そのまま差し替えると保存途中の壊れた TOML で
     /// ユーザーのオープナー設定が黙って消える。読めたときだけ差し替え、
     /// 失敗時は現在の設定を据え置く。load が持つ雛形生成の副作用も避けたい。
-    fn reload_config(&mut self) {
-        let msg = match crate::config::config_path() {
+    /// config.toml を再読み込みし、結果メッセージを返す(status_message へ
+    /// セットするのは呼び出し側)。`r` キー(そのままステータス表示)と、
+    /// エディタ終了時の自動リロード(「エディタ終了 — 」を前置して表示)で
+    /// 共有する。
+    fn reload_config_message(&mut self) -> String {
+        match crate::config::config_path() {
             None => "設定ファイルの場所を特定できませんでした".to_string(),
             Some(path) => match std::fs::read_to_string(&path) {
                 Err(e) => format!("config.toml を読めません(設定は据え置き): {}", e),
@@ -717,7 +818,11 @@ impl App {
                     }
                 },
             },
-        };
+        }
+    }
+
+    fn reload_config(&mut self) {
+        let msg = self.reload_config_message();
         self.status_message = Some(msg);
     }
 
@@ -1078,6 +1183,12 @@ impl App {
                 self.reload_config();
                 Ok(true)
             }
+            KeyCode::Char('e')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.open_config_in_editor();
+                Ok(true)
+            }
             KeyCode::Char('.') => {
                 self.ws_mut().file_tree.toggle_hidden();
                 Ok(true)
@@ -1319,12 +1430,29 @@ impl App {
     }
 
     /// Close a pane by ID, regardless of current focus. `close_focused_pane`
-    /// is a thin wrapper over this for the `Ctrl+W` path. Only reassigns
-    /// focus when the closed pane was the focused one — closing a
-    /// background pane (e.g. an editor pane whose PtyEof arrived while the
-    /// user has already moved focus elsewhere) must not steal focus.
+    /// is a thin wrapper over this for the `Ctrl+W` path (always targets
+    /// `self.ws()`, i.e. the active tab).
+    ///
+    /// Searches **every** workspace/tab for `pane_id`, not just the active
+    /// one: pane IDs are global (`next_pane_id` lives on `App`, not per
+    /// workspace), and a pane that needs closing by ID — e.g. an editor pane
+    /// whose `PtyEof` arrives after the user switched tabs — may not live in
+    /// the currently active tab. Using `ws_mut()` (active tab only) here
+    /// would silently no-op: `panes.remove` returns `None`, `kill()` never
+    /// runs, and the process is never reaped.
+    ///
+    /// Only reassigns focus when the closed pane was that workspace's
+    /// focused pane — closing a background pane must not steal focus.
     fn close_pane(&mut self, pane_id: usize) {
-        let ws = self.ws_mut();
+        let Some(ws_idx) = self
+            .workspaces
+            .iter()
+            .position(|ws| ws.panes.contains_key(&pane_id))
+        else {
+            return;
+        };
+
+        let ws = &mut self.workspaces[ws_idx];
         if ws.layout.pane_count() <= 1 {
             return;
         }
@@ -1341,7 +1469,7 @@ impl App {
 
         // Clean up claude monitor state for this pane
         self.claude_monitor.remove(pane_id);
-        let ws = self.ws_mut();
+        let ws = &mut self.workspaces[ws_idx];
 
         if was_focused {
             let remaining_ids = ws.layout.collect_pane_ids();
@@ -2000,11 +2128,29 @@ impl App {
         {
             match event {
                 AppEvent::PtyEof(pane_id) => {
+                    // editor_panes の判定はループの前に退避する。理由は2つ:
+                    // (1) 借用— ループ後に self.config / status_message を
+                    //     触るため、ループ内で判定すると &mut self.workspaces
+                    //     の借用と衝突する。
+                    // (2) 取りこぼし防止 — ユーザーが Ctrl+W でエディタペインを
+                    //     先に閉じた場合、close_pane は panes.remove() を
+                    //     kill() より先に行うため、その後届く PtyEof は
+                    //     「ペインが既に存在しない状態」になる。remove ベースの
+                    //     判定ならこの場合も自己クリーンできる(取りこぼしても
+                    //     実害はなく、config.rs の再読み込みが1回無駄になる程度)。
+                    let was_editor = self.editor_panes.remove(&pane_id);
+
                     for ws in &mut self.workspaces {
                         if let Some(pane) = ws.panes.get_mut(&pane_id) {
                             pane.exited = true;
                             break;
                         }
+                    }
+
+                    if was_editor {
+                        self.close_pane(pane_id);
+                        let msg = self.reload_config_message();
+                        self.status_message = Some(format!("エディタ終了 — {}", msg));
                     }
                 }
                 AppEvent::CwdChanged(pane_id, new_cwd) => {
@@ -2161,6 +2307,61 @@ fn os_default_action(
     } else {
         OsDefaultAction::Preview
     }
+}
+
+/// `e` キーで config.toml を開くとき、何をどう起動するか。FS にも FFI にも
+/// 直接触れない純粋な分岐結果(`os_default_action` と同じ設計)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditorAction {
+    /// ccmux のペイン内で PTY 起動(`[editor] in_pane = true`、または
+    /// command 未指定で `$VISUAL`/`$EDITOR` にフォールバックした場合)。
+    Pane { program: String, args: Vec<String> },
+    /// 既存の `spawn_detached` で別プロセスとして起動
+    /// (`[editor] in_pane = false`)。
+    Detached { program: String, args: Vec<String> },
+    /// command も環境変数も未設定 — OS 既定アプリへ委譲する
+    /// (`has_default_handler` 判定 → `spawn_detached`)。
+    OsDefault,
+    /// `config_path()` が `None`(`dirs::config_dir()` が無い環境)。
+    /// 起動しようがないので何もしない。
+    NoConfigPath,
+}
+
+/// `editor_action` の分岐そのもの。環境変数は呼び出し側で読んで渡す
+/// (この関数自体は env::var にも FS にも触れない — `should_try_external`
+/// が FFI を `impl FnOnce() -> bool` で遅延させているのと同じ思想)。
+/// 空文字列の環境変数(`EDITOR=""` のような設定ツール由来の値)は
+/// 「未設定」として扱う — プログラム名が空の spawn は必ず失敗し、
+/// 原因の分かりにくいエラーにしかならないため。
+fn editor_action(
+    editor: &crate::config::EditorConfig,
+    config_path: Option<&std::path::Path>,
+    visual: Option<&str>,
+    editor_env: Option<&str>,
+) -> EditorAction {
+    if config_path.is_none() {
+        return EditorAction::NoConfigPath;
+    }
+
+    if let Some(command) = editor.command.as_deref() {
+        let program = command.to_string();
+        return if editor.in_pane {
+            EditorAction::Pane { program, args: editor.args.clone() }
+        } else {
+            EditorAction::Detached { program, args: editor.args.clone() }
+        };
+    }
+
+    let env_editor = visual
+        .filter(|s| !s.is_empty())
+        .or_else(|| editor_env.filter(|s| !s.is_empty()));
+    if let Some(program) = env_editor {
+        // 環境変数由来のエディタは慣習上ターミナルエディタ。[editor] args は
+        // 適用しない(command 未指定 = args もユーザーの意図の外にあるため)。
+        return EditorAction::Pane { program: program.to_string(), args: Vec::new() };
+    }
+
+    EditorAction::OsDefault
 }
 
 // AssocQueryStringW(shlwapi.dll)。関連付けの ProgID を問い合わせる。
@@ -2608,6 +2809,76 @@ mod tests {
             true
         });
         assert!(!called.get(), "ディレクトリ経路で handler_present が呼ばれてはいけない");
+    }
+
+    // --- editor_action(config-editor: e キーでエディタを開く) ---
+
+    fn editor_cfg(command: Option<&str>, in_pane: bool) -> crate::config::EditorConfig {
+        crate::config::EditorConfig {
+            command: command.map(|s| s.to_string()),
+            args: Vec::new(),
+            in_pane,
+        }
+    }
+
+    #[test]
+    fn test_editor_action_no_config_path() {
+        let cfg = editor_cfg(None, true);
+        assert_eq!(
+            editor_action(&cfg, None, None, None),
+            EditorAction::NoConfigPath
+        );
+    }
+
+    #[test]
+    fn test_editor_action_command_in_pane() {
+        let cfg = editor_cfg(Some("vim"), true);
+        let path = std::path::PathBuf::from("C:/dummy/config.toml");
+        assert_eq!(
+            editor_action(&cfg, Some(&path), None, None),
+            EditorAction::Pane { program: "vim".to_string(), args: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn test_editor_action_command_detached() {
+        let cfg = editor_cfg(Some("notepad.exe"), false);
+        let path = std::path::PathBuf::from("C:/dummy/config.toml");
+        assert_eq!(
+            editor_action(&cfg, Some(&path), None, None),
+            EditorAction::Detached { program: "notepad.exe".to_string(), args: Vec::new() }
+        );
+    }
+
+    #[test]
+    fn test_editor_action_falls_back_to_visual_then_editor_env() {
+        let cfg = editor_cfg(None, true);
+        let path = std::path::PathBuf::from("C:/dummy/config.toml");
+        // $VISUAL が優先
+        assert_eq!(
+            editor_action(&cfg, Some(&path), Some("nvim"), Some("nano")),
+            EditorAction::Pane { program: "nvim".to_string(), args: Vec::new() }
+        );
+        // $VISUAL 無しなら $EDITOR
+        assert_eq!(
+            editor_action(&cfg, Some(&path), None, Some("nano")),
+            EditorAction::Pane { program: "nano".to_string(), args: Vec::new() }
+        );
+        // 空文字列は未設定として扱う(EDITOR="" のようなツール由来の値)
+        assert_eq!(
+            editor_action(&cfg, Some(&path), Some(""), Some("")),
+            EditorAction::OsDefault
+        );
+    }
+
+    #[test]
+    fn test_editor_action_os_default_when_nothing_configured() {
+        let cfg = editor_cfg(None, true);
+        let path = std::path::PathBuf::from("C:/dummy/config.toml");
+        assert_eq!(
+            editor_action(&cfg, Some(&path), None, None),
+            EditorAction::OsDefault
+        );
     }
 
     #[test]

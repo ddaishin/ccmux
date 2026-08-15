@@ -10,6 +10,7 @@
 #   o = この設定に関係なく OS の既定アプリで開く(ディレクトリも可。
 #       ディレクトリの挙動は下の open_directory_with_os_default で変えられます)
 #   r = このファイルを再読み込み([[openers]] と open_directory_with_os_default が反映)
+#   e = このファイル(config.toml)自体をエディタで開く(下の [editor] 参照)
 #
 # マッチの書き方:
 # - extensions はドットなし。ファイル名の末尾一致(ドット境界)なので
@@ -73,3 +74,21 @@
 # xdg-open が入っていない環境や headless 環境で、o の誤爆を防ぎたいときに。
 # r キーで再起動なしに反映されます。
 #open_directory_with_os_default = true
+
+# [editor] = ファイルツリーで e を押したとき、このファイル(config.toml)を
+# 開くエディタの設定です。command を省略すると $VISUAL -> $EDITOR -> OS の
+# 既定アプリの順にフォールバックします。
+#[editor]
+# command = vim / nano のようなターミナルエディタは in_pane = true(既定)の
+# ままで構いません。VS Code や メモ帳のような GUI エディタを使う場合は、
+# 下の in_pane を false にしてください(true のままだと、ペイン内で GUI
+# エディタのプロセスがすぐ制御を返してしまい、何も起きたように見えません)。
+#command = "vim"
+# args を省略すると絶対パスが末尾に付きます(= args = ["{file}"] と同じ)。
+#args = ["{file}"]
+# true(既定) = ccmux のペイン内で起動(ターミナルエディタ向け)。
+# false = 別ウィンドウで起動(GUI エディタ向け)。
+#in_pane = true
+# in_pane = true で開いたエディタを閉じると、config.toml は自動で
+# 再読み込みされます。in_pane = false(GUI エディタ)の場合は、閉じても
+# 自動では反映されないため r キーで手動リロードしてください。
