@@ -8,6 +8,12 @@
 ## Overview
 Rust TUI tool for managing multiple Claude Code instances in split panes.
 
+作業種別: 開発
+
+## 作業の境界
+- 確認なしで進めてよい: 編集・ビルド・テスト・ローカル commit・`fork` / ローカル統合ブランチへの push
+- 確認を取る: tag の作成と push（release CI と npm publish が走る）、`origin`（upstream・READ 権限）への操作、グローバル `ccmux.exe` の差し替え、upstream への PR 作成
+
 ## Tech Stack
 - Rust (stable), ratatui + crossterm, portable-pty, vt100
 
@@ -62,6 +68,7 @@ cargo run            # Run the app
   2. `fix/wide-char-copy-extra-spaces` — 全角文字コピー時の空白混入修正（vt100 wide continuation セル）
   3. `perf/event-driven-display` — イベント駆動ループ＋入力専用スレッド＋60fps ペーシング（latency 中央値 44.8ms→16ms・仕様書: `docs/specs/display-performance/`）
   4. 拡張子別の外部オープナーとステータスバー修正 — ブランチを切らず `local/v0.6.2-patched` へ直接コミット（`feat(opener)` = OS 既定アプリ委譲・`o` / `r` キー・仕様書 `docs/specs/external-opener/`、`fix(ui)` = 右側情報がキーヒントを覆う問題）
+  5. `feat/filetree-mtime-sort` — ファイルツリーを更新日時の降順で並べ、`s` キーで名前順と切り替え（題に `FILES 更新順` / `FILES 名前順`・キーヒントは `Esc 戻る` と入れ替え・仕様書 `docs/specs/filetree-mtime-sort/`）
 - いずれも upstream 未 PR。PR 時は各ブランチを個別に fork へ push する
 
 ### グローバル exe の差し替え手順
@@ -69,4 +76,4 @@ cargo run            # Run the app
 `mv ccmux.exe ccmux.exe.prev-<id>` と退避してから `cp target/release/ccmux.exe ccmux.exe` を
 配置し（退避と配置は 1 コマンドに繋いで欠損窓を作らない）、**sha256 でビルド成果物と照合**する
 （サイズ・日時では判定しない — 別ビルドでサイズが一致した実績がある）。退避版がロールバック先。
-現存: `ccmux.exe.prev-20260722`（直前の版）/ `ccmux.exe.prev-d7ac14f`（footprint 改修前）。
+現存: `ccmux.exe.prev-4594f24`（直前の版・filetree-mtime-sort 導入前）/ `ccmux.exe.prev-20260722` ほか日付付きの旧版 / `ccmux.exe.prev-d7ac14f`（footprint 改修前）。
