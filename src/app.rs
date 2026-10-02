@@ -2193,9 +2193,7 @@ impl App {
                                     ws.file_tree.toggle_hidden();
                                 }
                                 // 並び順も同様に引き継ぐ(代入だけだと題と並びがずれる)
-                                if ws.file_tree.sort_mode != prev_sort_mode {
-                                    ws.file_tree.toggle_sort();
-                                }
+                                ws.file_tree.set_sort_mode(prev_sort_mode);
                                 ws.cwd = new_cwd;
                                 ws.name = dir_name(&ws.cwd);
                                 ws.preview.close();

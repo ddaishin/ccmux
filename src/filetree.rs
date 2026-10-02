@@ -197,7 +197,15 @@ impl FileTree {
     /// 並び順を切り替える。保持している子を走査し直さずに並べ直し、
     /// 展開状態と選択中のパスを保つ(toggle_hidden のように先頭へ戻さない)。
     pub fn toggle_sort(&mut self) {
-        self.sort_mode = self.sort_mode.toggled();
+        self.set_sort_mode(self.sort_mode.toggled());
+    }
+
+    /// 並び順を指定して並べ直す(OSC 7 での作り直し時の引き継ぎにも使う)。
+    pub fn set_sort_mode(&mut self, mode: SortMode) {
+        if self.sort_mode == mode {
+            return;
+        }
+        self.sort_mode = mode;
         let selected_path = self.selected_path();
         Self::resort_recursive(&mut self.entries, self.sort_mode);
         self.rebuild_flat();
@@ -565,6 +573,14 @@ mod tests {
             std::process::id(),
             nanos
         ));
+        // assert が失敗しても一時ディレクトリを残さない
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
         let sub = root.join("sub");
         fs::create_dir_all(&sub).unwrap();
         // 名前順(a, b)と mtime 順(b が新しい)が逆になるように置く。
@@ -610,6 +626,18 @@ mod tests {
         assert_eq!(tree.sort_mode, SortMode::Modified);
         assert_eq!(child_names(&tree), ["b.txt", "a.txt"]);
 
-        let _ = fs::remove_dir_all(&root);
+        // 同じモードの指定は何もしない(OSC 7 の引き継ぎで使う)
+        tree.set_sort_mode(SortMode::Modified);
+        assert_eq!(child_names(&tree), ["b.txt", "a.txt"]);
+        tree.set_sort_mode(SortMode::Name);
+        assert_eq!(child_names(&tree), ["a.txt", "b.txt"]);
+    }
+
+    #[test]
+    fn test_sort_mode_label() {
+        // サイドバーの題 " FILES <label> " に出す表記(requirements の EARS)
+        assert_eq!(SortMode::default(), SortMode::Modified);
+        assert_eq!(SortMode::Modified.label(), "更新順");
+        assert_eq!(SortMode::Name.label(), "名前順");
     }
 }
