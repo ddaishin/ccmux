@@ -258,7 +258,11 @@ fn render_file_tree(app: &mut App, frame: &mut Frame, area: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(border_color))
-        .title(Span::styled(" FILES ", title_style))
+        // 並び順を題に出す(`s` で切り替え)
+        .title(Span::styled(
+            format!(" FILES {} ", app.ws().file_tree.sort_mode.label()),
+            title_style,
+        ))
         .style(Style::default().bg(PANEL_BG));
 
     let inner = block.inner(area);
@@ -852,8 +856,10 @@ fn focus_hints(focus: FocusTarget) -> Line<'static> {
             // 右端の ^F / ^Q まで見えるよう「隠しファイル」から短縮
             Span::styled(".", Style::default().fg(ACCENT_BLUE)),
             Span::styled(" 隠し ", Style::default().fg(TEXT_DIM)),
-            Span::styled("Esc", Style::default().fg(ACCENT_BLUE)),
-            Span::styled(" 戻る ", Style::default().fg(TEXT_DIM)),
+            // 予算 75 桁に収めるため「Esc 戻る」と入れ替え(Esc は標準操作で、
+            // ペインのクリックでも戻れる。filetree-mtime-sort design ADR-3)
+            Span::styled("s", Style::default().fg(ACCENT_BLUE)),
+            Span::styled(" 並替 ", Style::default().fg(TEXT_DIM)),
             Span::styled("^F", Style::default().fg(ACCENT_BLUE)),
             Span::styled(" 閉じる ", Style::default().fg(TEXT_DIM)),
             Span::styled("^Q", Style::default().fg(ACCENT_BLUE)),
@@ -1082,5 +1088,15 @@ mod tests {
             let w = focus_hints(focus).width() as u16;
             assert!(w <= budget, "{:?} のヒントが {} 桁(予算 {} 桁)", focus, w, budget);
         }
+    }
+
+    #[test]
+    fn test_file_tree_hints_include_sort_key() {
+        let text: String = focus_hints(FocusTarget::FileTree)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("並替"), "FileTree のヒントに並べ替えキーが無い: {}", text);
     }
 }

@@ -1193,6 +1193,14 @@ impl App {
                 self.ws_mut().file_tree.toggle_hidden();
                 Ok(true)
             }
+            // 並び順(更新順 / 名前順)の切り替え。Alt+S はステータスバー切替として
+            // 先に消費されるが、Ctrl+S は届くため 'o' / 'r' と同じくガードする。
+            KeyCode::Char('s')
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.ws_mut().file_tree.toggle_sort();
+                Ok(true)
+            }
             KeyCode::Esc => {
                 // Return to pane, keep preview open
                 self.ws_mut().focus_target = FocusTarget::Pane;
@@ -2177,11 +2185,16 @@ impl App {
                             }
                             if ws.focused_pane_id == pane_id {
                                 let prev_show_hidden = ws.file_tree.show_hidden;
+                                let prev_sort_mode = ws.file_tree.sort_mode;
                                 ws.file_tree = FileTree::new(new_cwd.clone());
                                 // FileTree::new defaults to show_hidden=true
                                 // Only toggle if the previous state was different
                                 if ws.file_tree.show_hidden != prev_show_hidden {
                                     ws.file_tree.toggle_hidden();
+                                }
+                                // 並び順も同様に引き継ぐ(代入だけだと題と並びがずれる)
+                                if ws.file_tree.sort_mode != prev_sort_mode {
+                                    ws.file_tree.toggle_sort();
                                 }
                                 ws.cwd = new_cwd;
                                 ws.name = dir_name(&ws.cwd);
