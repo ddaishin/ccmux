@@ -69,6 +69,7 @@ cargo run            # Run the app
   3. `perf/event-driven-display` — イベント駆動ループ＋入力専用スレッド＋60fps ペーシング（latency 中央値 44.8ms→16ms・仕様書: `docs/specs/display-performance/`）
   4. 拡張子別の外部オープナーとステータスバー修正 — ブランチを切らず `local/v0.6.2-patched` へ直接コミット（`feat(opener)` = OS 既定アプリ委譲・`o` / `r` キー・仕様書 `docs/specs/external-opener/`、`fix(ui)` = 右側情報がキーヒントを覆う問題）
   5. `feat/filetree-mtime-sort` — ファイルツリーを更新日時の降順で並べ、`s` キーで名前順と切り替え（題に `FILES 更新順` / `FILES 名前順`・キーヒントは `Esc 戻る` と入れ替え・仕様書 `docs/specs/filetree-mtime-sort/`）
+  6. `pr/forward-mouse-click` — マウス報告を有効にしたアプリ（Claude Code のフルスクリーン表示など）のペインで、動かさずに離した左クリックを PTY に転送（ドラッグは従来どおり ccmux の選択）。upstream master から切ったブランチで、upstream への PR 用
 - いずれも upstream 未 PR。PR 時は各ブランチを個別に fork へ push する
 
 ### グローバル exe の差し替え手順
