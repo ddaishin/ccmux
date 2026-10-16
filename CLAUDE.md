@@ -70,7 +70,7 @@ cargo run            # Run the app
   4. 拡張子別の外部オープナーとステータスバー修正 — ブランチを切らず `local/v0.6.2-patched` へ直接コミット（`feat(opener)` = OS 既定アプリ委譲・`o` / `r` キー・仕様書 `docs/specs/external-opener/`、`fix(ui)` = 右側情報がキーヒントを覆う問題）
   5. `feat/filetree-mtime-sort` — ファイルツリーを更新日時の降順で並べ、`s` キーで名前順と切り替え（題に `FILES 更新順` / `FILES 名前順`・キーヒントは `Esc 戻る` と入れ替え・仕様書 `docs/specs/filetree-mtime-sort/`）
   6. `pr/forward-mouse-click` — マウス報告を有効にしたアプリ（Claude Code のフルスクリーン表示など）のペインで、動かさずに離した左クリックを PTY に転送（ドラッグは従来どおり ccmux の選択）。upstream master から切ったブランチで、upstream PR #23
-  7. `pr/fix-wheel-offset` — PTY に転送するホイールの座標から枠の 1 セルを引く（`pane_content_cell`）。upstream master から切った PR 用ブランチ
+  7. `pr/fix-wheel-offset` — PTY に転送するホイールの座標から枠の 1 セルを引く（`pane_content_cell`）。upstream master から切ったブランチで、upstream PR #24。#23 と同じ位置に関数を足しているので、片方がマージされたらもう片方を upstream master に rebase して push し直す
 - いずれも upstream 未 PR。PR 時は各ブランチを個別に fork へ push する
 
 ### グローバル exe の差し替え手順
